@@ -49,12 +49,13 @@ RUN mkdir -p /workspace/comfywan/custom_nodes && \
     git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
       /workspace/comfywan/custom_nodes/ComfyUI-Manager
 
-# (Removed the invalid optional COPY of extra_model_paths.yaml)
-
 # ---- Handler + launcher
+WORKDIR /workspace
 COPY rp_handler.py /rp_handler.py
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-EXPOSE 3000
-CMD ["bash", "/start.sh"]
+# ComfyUI listens on 8188 (internal); RunPod doesn't require EXPOSE but keep it accurate
+EXPOSE 8188
+
+CMD ["/start.sh"]
