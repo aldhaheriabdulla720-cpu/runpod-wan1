@@ -66,18 +66,35 @@ fi
 # ---------------------------
 # Launch ComfyUI headless
 # ---------------------------
+# ---------------------------
+# Launch ComfyUI headless (no --data-dir; use per-dir flags)
+# ---------------------------
 cd /workspace/comfywan
+
+OUT_DIR="${COMFY_OUTPUT_DIR:-/workspace/output}"
+IN_DIR="${COMFY_INPUT_DIR:-/workspace/input}"
+TMP_DIR="${COMFY_TEMP_DIR:-/workspace/temp}"
+mkdir -p "$OUT_DIR" "$IN_DIR" "$TMP_DIR"
 
 HOST_ARG="--listen $COMFY_HOST"
 PORT_ARG="--port $COMFY_PORT"
-DATA_ARG="--data-dir $COMFY_DATA_DIR"
+OUT_ARG="--output-directory $OUT_DIR"
+IN_ARG="--input-directory $IN_DIR"
+TMP_ARG="--temp-directory $TMP_DIR"
+EXTRA_CFG_ARG="--extra-model-paths-config /root/.config/ComfyUI/extra_model_paths.yaml"
 
-echo "[start] Starting ComfyUI..."
-$PYTHON main.py $HOST_ARG $PORT_ARG $DATA_ARG $COMFY_ARGS > /tmp/comfyui.log 2>&1 &
+ARGS="$HOST_ARG $PORT_ARG $OUT_ARG $IN_ARG $TMP_ARG $EXTRA_CFG_ARG"
+if [ -n "${COMFY_ARGS:-}" ]; then
+  ARGS="$ARGS $COMFY_ARGS"
+fi
+
+echo "[start] Starting ComfyUI with: $ARGS"
+$PYTHON main.py $ARGS > /tmp/comfyui.log 2>&1 &
 COMFY_PID=$!
 
 # Clean up on exit
 trap 'kill -TERM $COMFY_PID 2>/dev/null || true' EXIT
+
 
 # ---------------------------
 # Health check
