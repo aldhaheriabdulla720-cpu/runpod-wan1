@@ -1,7 +1,7 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Set at RunPod → Endpoint → Environment Variables
+# Set this in RunPod Endpoint → Environment Variables (do NOT hardcode in Dockerfile)
 ENV HF_TOKEN=${HF_TOKEN}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu12
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
 WORKDIR /workspace/comfywan
 
-# Safe pins for dependencies (avoid build failures)
+# Safe pins + ComfyUI deps
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     pillow==10.3.0 \
@@ -33,19 +33,17 @@ RUN pip install --no-cache-dir \
 WORKDIR /workspace/comfywan/custom_nodes
 RUN git clone --depth=1 https://github.com/city96/ComfyUI-GGUF.git
 RUN git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
-RUN pip install --no-cache-dir imageio-ffmpeg tqdm
 RUN git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager.git
+RUN pip install --no-cache-dir imageio-ffmpeg tqdm
 
 # Back to comfy root
 WORKDIR /workspace/comfywan
 
-# --- Runtime deps ---
+# --- Runtime deps (RunPod handler etc.) ---
 RUN pip install --no-cache-dir runpod==1.7.9 requests websockets safetensors
 
 # --- WAN 2.2 models (requires HF token) ---
-# We download the exact filenames shown on the HF pages you shared:
-# - models_t5_umt5-xxl-enc-bf16.pth (main checkpoint)
-# - Wan2.1_VAE.pth (VAE)
+# We rename to clear, short filenames AND create multiple symlinks to absorb legacy ckpt_name variants.
 RUN mkdir -p /workspace/models/diffusion_models /workspace/models/vae && \
     aria2c -x 4 -s 4 \
       --header="Authorization: Bearer ${HF_TOKEN}" \
@@ -61,14 +59,21 @@ RUN mkdir -p /workspace/models/diffusion_models /workspace/models/vae && \
       --header="Authorization: Bearer ${HF_TOKEN}" \
       -d /workspace/models/vae \
       -o Wan2.1_VAE.pth \
-      "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/Wan2.1_VAE.pth?download=true"
+      "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/Wan2.1_VAE.pth?download=true" && \
+    # ---- Compatibility symlinks (common ckpt_name spellings) ----
+    cd /workspace/models/diffusion_models && \
+    ln -sf wan2.2-t2v-a14b.pth wan2.2.safetensors && \
+    ln -sf wan2.2-t2v-a14b.pth wan2.2.ckpt && \
+    ln -sf wan2.2-t2v-a14b.pth wan2.2.pth && \
+    ln -sf wan2.2-i2v-a14b.pth wan2.2-i2v.safetensors && \
+    ln -sf wan2.2-i2v-a14b.pth wan2.2-i2v.ckpt && \
+    ln -sf wan2.2-i2v-a14b.pth wan2.2-i2v.pth
 
-# --- Optional: public encoders (harmless to keep) ---
+# --- Optional encoders (harmless; ignore failures) ---
 RUN mkdir -p /workspace/models/text_encoders && \
     aria2c -x 4 -s 4 -d /workspace/models/text_encoders \
       -o clip_text.pth \
       "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin?download=true" || true
-
 RUN mkdir -p /workspace/models/clip_vision && \
     aria2c -x 4 -s 4 -d /workspace/models/clip_vision \
       -o clip_vision.pth \
