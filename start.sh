@@ -1,121 +1,66 @@
 #!/usr/bin/env bash
-# Ensure this script is executable even if repo clone dropped permissions
-if [ ! -x "$0" ]; then
-  chmod +x "$0" || true
-fi
+set -Eeuo pipefail
 
-set -euo pipefail
+log() { printf "[start] %s\n" "$*" >&2; }
 
-# ---------------------------
-# Defaults (overridable via RunPod env panel)
-# ---------------------------
+# ---------- env sanity ----------
+: "${COMFY_APP:?COMFY_APP is required (folder with ComfyUI main.py)}}"
 : "${COMFY_HOST:=0.0.0.0}"
 : "${COMFY_PORT:=8188}"
-: "${COMFY_DATA_DIR:=/workspace}"         # data-dir for ComfyUI (outputs -> $COMFY_DATA_DIR/output)
+: "${COMFY_DATA_DIR:=/workspace}"
 : "${COMFY_ARGS:=--disable-auto-launch}"
-: "${PYTHON:=python3}"
-: "${HEALTH_RETRIES:=90}"                 # 90 * 2s = 3 minutes
-: "${HEALTH_SLEEP:=2}"
-: "${RP_HANDLER_TIMEOUT:=1800}"
+: "${RUNPOD_HANDLER_PATH:=/workspace/rp_handler.py}"
 
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/workspace/.cache}"
 
-echo "[start] COMFY_HOST=$COMFY_HOST COMFY_PORT=$COMFY_PORT DATA=$COMFY_DATA_DIR"
+mkdir -p "$COMFY_DATA_DIR" "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" /tmp
 
-# ---------------------------
-# Ensure base folders
-# ---------------------------
-mkdir -p "$COMFY_DATA_DIR" "$COMFY_DATA_DIR/output"
+# ---------- launch ComfyUI in background ----------
+log "Starting ComfyUI from $COMFY_APP ..."
+cd "$COMFY_APP"
 
-# Preferred network volume model layout
-for d in /runpod-volume/wan /runpod-volume/vae /runpod-volume/clip /runpod-volume/unet /runpod-volume/lora; do
-  mkdir -p "$d" || true
-done
-# Local fallbacks
-mkdir -p /workspace/wan /workspace/vae /workspace/clip /workspace/unet /workspace/lora /workspace/comfywan/models/unet || true
+HOST_ARG=(--listen "$COMFY_HOST")
+PORT_ARG=(--port "$COMFY_PORT")
+OUTPUT_ARG=(--output-directory "$COMFY_DATA_DIR")
 
-# ---------------------------
-# Configure extra model paths (includes UNET)
-# ---------------------------
-mkdir -p /root/.config/ComfyUI
-cat > /root/.config/ComfyUI/extra_model_paths.yaml <<'YAML'
-checkpoints: [/runpod-volume/wan, /workspace/wan]
-vae:         [/runpod-volume/vae, /workspace/vae]
-clip:        [/runpod-volume/clip, /workspace/clip]
-unet:        [/runpod-volume/unet, /workspace/comfywan/models/unet, /workspace/unet]
-loras:       [/runpod-volume/lora, /workspace/lora]
-YAML
-
-# ---------------------------
-# Ensure ComfyUI exists at /workspace/comfywan (image clones it here)
-# If missing (custom image), clone it now.
-# ---------------------------
-if [ ! -f "/workspace/comfywan/main.py" ]; then
-  echo "[start] ComfyUI not found at /workspace/comfywan — cloning…"
-  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
-fi
-
-# ---------------------------
-# Activate venv if exists
-# ---------------------------
-if [ -d "/venv" ]; then
-  # shellcheck disable=SC1091
-  source /venv/bin/activate
-fi
-
-# ---------------------------
-# Launch ComfyUI headless
-# ---------------------------
-# ---------------------------
-# Launch ComfyUI headless (no --data-dir; use per-dir flags)
-# ---------------------------
-cd /workspace/comfywan
-
-OUT_DIR="${COMFY_OUTPUT_DIR:-/workspace/output}"
-IN_DIR="${COMFY_INPUT_DIR:-/workspace/input}"
-TMP_DIR="${COMFY_TEMP_DIR:-/workspace/temp}"
-mkdir -p "$OUT_DIR" "$IN_DIR" "$TMP_DIR"
-
-HOST_ARG="--listen $COMFY_HOST"
-PORT_ARG="--port $COMFY_PORT"
-OUT_ARG="--output-directory $OUT_DIR"
-IN_ARG="--input-directory $IN_DIR"
-TMP_ARG="--temp-directory $TMP_DIR"
-EXTRA_CFG_ARG="--extra-model-paths-config /root/.config/ComfyUI/extra_model_paths.yaml"
-
-ARGS="$HOST_ARG $PORT_ARG $OUT_ARG $IN_ARG $TMP_ARG $EXTRA_CFG_ARG"
-if [ -n "${COMFY_ARGS:-}" ]; then
-  ARGS="$ARGS $COMFY_ARGS"
-fi
-
-echo "[start] Starting ComfyUI with: $ARGS"
-$PYTHON main.py $ARGS > /tmp/comfyui.log 2>&1 &
+echo "[start] ComfyUI launching..." > /tmp/comfyui.log
+python3 main.py "${HOST_ARG[@]}" "${PORT_ARG[@]}" "${OUTPUT_ARG[@]}" $COMFY_ARGS >> /tmp/comfyui.log 2>&1 &
 COMFY_PID=$!
+log "ComfyUI PID = $COMFY_PID"
 
-# Clean up on exit
-trap 'kill -TERM $COMFY_PID 2>/dev/null || true' EXIT
+# Clean up gracefully on container stop
+cleanup() {
+  log "Shutting down (SIGTERM)."
+  kill -TERM "$COMFY_PID" 2>/dev/null || true
+  wait "$COMFY_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
-
-# ---------------------------
-# Health check
-# ---------------------------
-HEALTH_URL="http://127.0.0.1:$COMFY_PORT/system_stats"
-tries=0
-until curl -sf "$HEALTH_URL" >/dev/null 2>&1; do
-  tries=$((tries+1))
-  if [ "$tries" -ge "$HEALTH_RETRIES" ]; then
-    echo "[start][FATAL] ComfyUI failed to become healthy. Last 200 lines:"
+# ---------- wait for readiness ----------
+log "Waiting for ComfyUI to listen on :$COMFY_PORT ..."
+RETRIES=120
+until curl -sSf "http://127.0.0.1:${COMFY_PORT}/" >/dev/null 2>&1; do
+  ((RETRIES--)) || { 
+    log "ComfyUI did not become ready. Dumping last 200 log lines:"
     tail -n 200 /tmp/comfyui.log || true
     exit 1
-  fi
-  echo "[start] Waiting for ComfyUI ($tries/$HEALTH_RETRIES)…"
-  sleep "$HEALTH_SLEEP"
+  }
+  sleep 1
 done
-echo "[start] ComfyUI is healthy."
+log "ComfyUI is up on http://127.0.0.1:${COMFY_PORT}"
 
-# ---------------------------
-# Launch RunPod handler (handler lives at /rp_handler.py)
-# ---------------------------
-export RP_HANDLER_TIMEOUT
-echo "[start] Launching rp_handler.py"
-exec $PYTHON /rp_handler.py
+# Optional: background-tail the Comfy log for easy debugging in RunPod logs
+( tail -n +1 -F /tmp/comfyui.log 2>/dev/null | sed -u 's/^/[comfy] /' ) &
+
+# ---------- start RunPod handler in foreground ----------
+if [[ -f "$RUNPOD_HANDLER_PATH" ]]; then
+  log "Starting RunPod serverless handler: $RUNPOD_HANDLER_PATH"
+  exec python3 -m runpod --handler-path "$RUNPOD_HANDLER_PATH"
+else
+  log "ERROR: RUNPOD_HANDLER_PATH not found at $RUNPOD_HANDLER_PATH"
+  exit 2
+fi
