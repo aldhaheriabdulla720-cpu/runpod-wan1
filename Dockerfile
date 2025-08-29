@@ -33,7 +33,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ---- Common video deps for nodes
 RUN pip install --no-cache-dir \
     safetensors==0.4.3 opencv-python imageio[ffmpeg] decord moviepy einops \
-    transformers accelerate huggingface_hub mutagen websocket-client requests
+    transformers accelerate huggingface_hub mutagen websocket-client requests \
+    runpod   # <<< ADDED so rp_handler.py works
 
 # ---- Custom nodes
 RUN mkdir -p /workspace/comfywan/custom_nodes && \
@@ -48,7 +49,7 @@ RUN mkdir -p /workspace/comfywan/custom_nodes && \
     git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
       /workspace/comfywan/custom_nodes/ComfyUI-Manager
 
-# ---- (Optional) ship a default extra_model_paths; start.sh will overwrite to volume if present
+# ---- (Optional) ship a default extra_model_paths; start.sh will overwrite
 COPY extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml || true
 
 # ---- Handler + launcher
@@ -58,5 +59,4 @@ RUN chmod +x /start.sh
 
 EXPOSE 3000
 
-# RunPod will execute this; it calls our start.sh which launches rp_handler.py
 CMD ["bash", "/start.sh"]
