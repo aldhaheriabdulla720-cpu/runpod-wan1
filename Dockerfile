@@ -1,61 +1,39 @@
-# ComfyUI + WanVideoWrapper + VideoHelperSuite, ready for RunPod Serverless
-FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_PREFER_BINARY=1 \
-    HF_HOME=/workspace/.cache/huggingface \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9+PTX;9.0"
+# Ensure Python 3.10
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3.10-dev python3-pip git curl aria2 wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /workspace
 
-# ---- System deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-dev python3.10-venv python3-pip \
-    git git-lfs ffmpeg curl ca-certificates \
-    build-essential pkg-config libgl1 libglib2.0-0 aria2 wget vim \
- && ln -sf /usr/bin/python3.10 /usr/bin/python \
- && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
- && python -m pip install --upgrade pip \
- && rm -rf /var/lib/apt/lists/*
+# Torch 2.4.1 CUDA 12.1
+RUN pip install --no-cache-dir torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
 
-# ---- Torch (CUDA 12.1 wheels)
-RUN pip install --no-cache-dir \
-      torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121 \
- && pip install --no-cache-dir xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu121 || true
-
-# ---- Clone ComfyUI
-RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
+# Clone ComfyUI
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git comfywan
 WORKDIR /workspace/comfywan
+
+# Install core deps
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Common video deps for nodes (+ runpod SDK)
-RUN pip install --no-cache-dir \
-    safetensors==0.4.3 opencv-python imageio[ffmpeg] decord moviepy einops \
-    transformers accelerate huggingface_hub mutagen websocket-client requests \
-    runpod
+# Custom nodes
+RUN git clone https://github.com/ltdrdata/ComfyUI-Manager.git custom_nodes/ComfyUI-Manager && pip install -r custom_nodes/ComfyUI-Manager/requirements.txt
+RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/ComfyUI-KJNodes && pip install -r custom_nodes/ComfyUI-KJNodes/requirements.txt
+RUN git clone https://github.com/welltop-cn/ComfyUI-TeaCache.git custom_nodes/ComfyUI-TeaCache && pip install -r custom_nodes/ComfyUI-TeaCache/requirements.txt
 
-# ---- Custom nodes
-RUN mkdir -p /workspace/comfywan/custom_nodes && \
-    git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
-      /workspace/comfywan/custom_nodes/ComfyUI-WanVideoWrapper && \
-    (test -f /workspace/comfywan/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt && \
-      pip install --no-cache-dir -r /workspace/comfywan/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt || true) && \
-    git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
-      /workspace/comfywan/custom_nodes/ComfyUI-VideoHelperSuite && \
-    (test -f /workspace/comfywan/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt && \
-      pip install --no-cache-dir -r /workspace/comfywan/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt || true) && \
-    git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
-      /workspace/comfywan/custom_nodes/ComfyUI-Manager
+# RunPod + extras
+RUN pip install --no-cache-dir runpod==1.7.9 websocket-client onnxruntime-gpu triton mutagen requests
 
-# ---- Handler + launcher
-WORKDIR /workspace
-COPY rp_handler.py /rp_handler.py
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+# Copy repo files
+COPY start.sh /workspace/comfywan/start.sh
+COPY rp_handler.py /workspace/comfywan/rp_handler.py
+COPY workflows/ /workspace/comfywan/workflows/
+COPY extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml
 
-# ComfyUI listens on 8188 (internal); RunPod doesn't require EXPOSE but keep it accurate
-EXPOSE 8188
+WORKDIR /workspace/comfywan
+RUN chmod +x start.sh
 
-CMD ["/start.sh"]
+ENTRYPOINT ["bash", "start.sh"]
