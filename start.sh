@@ -1,58 +1,110 @@
 #!/usr/bin/env bash
+# Ensure this script is executable even if repo clone dropped permissions
+if [ ! -x "$0" ]; then
+  chmod +x "$0" || true
+fi
+
 set -euo pipefail
 
-echo "[boot] starting worker…"
+# ---------------------------
+# Defaults (overridable via RunPod env panel)
+# ---------------------------
+: "${COMFY_HOST:=0.0.0.0}"
+: "${COMFY_PORT:=8188}"
+: "${COMFY_DATA_DIR:=/workspace}"
+: "${COMFY_ARGS:=--disable-auto-launch}"
+: "${PYTHON:=python3}"
+: "${HEALTH_RETRIES:=90}"
+: "${HEALTH_SLEEP:=2}"
+: "${RP_HANDLER_TIMEOUT:=1800}"
 
-APP_DIR="/workspace"
-COMFY_DIR="${APP_DIR}/comfywan"
-VOLUME_DIR="/runpod-volume"   # RunPod network volume (if mounted)
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
-# ---------- Cache dirs ----------
-if [[ -d "${VOLUME_DIR}" ]]; then
-  echo "[boot] network volume detected at ${VOLUME_DIR}"
-  export HF_HOME="${VOLUME_DIR}/hf"
-  export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
-  export TORCH_HOME="${VOLUME_DIR}/torch"
-  export WAN_CACHE="${VOLUME_DIR}/wan"
-else
-  echo "[boot] no network volume; using image-local caches"
-  export HF_HOME="${APP_DIR}/.cache/huggingface"
-  export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
-  export TORCH_HOME="${APP_DIR}/.cache/torch"
-  export WAN_CACHE="${APP_DIR}/wan"
-fi
-export TOKENIZERS_PARALLELISM=false
-export HF_HUB_ENABLE_HF_TRANSFER=1
-mkdir -p "${TRANSFORMERS_CACHE}" "${TORCH_HOME}" "${WAN_CACHE}" || true
+echo "[start] COMFY_HOST=$COMFY_HOST COMFY_PORT=$COMFY_PORT DATA=$COMFY_DATA_DIR"
 
-# ---------- ComfyUI model paths (persist on volume if present) ----------
+# ---------------------------
+# Ensure base folders
+# ---------------------------
+mkdir -p "$COMFY_DATA_DIR" \
+         "$COMFY_DATA_DIR/ComfyUI" \
+         "$COMFY_DATA_DIR/output"
+
+for d in /runpod-volume/wan /runpod-volume/vae /runpod-volume/clip /runpod-volume/unet /runpod-volume/lora; do
+  mkdir -p "$d" || true
+done
+mkdir -p /workspace/wan /workspace/vae /workspace/clip /workspace/unet /workspace/lora /workspace/comfywan/models/unet || true
+
+# ---------------------------
+# Configure extra model paths (includes UNET)
+# ---------------------------
 mkdir -p /root/.config/ComfyUI
 cat > /root/.config/ComfyUI/extra_model_paths.yaml <<'YAML'
 checkpoints: [/runpod-volume/wan, /workspace/wan]
 vae:         [/runpod-volume/vae, /workspace/vae]
 clip:        [/runpod-volume/clip, /workspace/clip]
+unet:        [/runpod-volume/unet, /workspace/comfywan/models/unet, /workspace/unet]
 loras:       [/runpod-volume/lora, /workspace/lora]
 YAML
 
-# ---------- Diagnostics ----------
-python -V || true
-echo "[boot] CUDA from base image (if present):"
-command -v nvidia-smi >/dev/null && nvidia-smi || echo "(nvidia-smi not present in runtime)"
+# ---------------------------
+# Fetch ComfyUI if not already present
+# ---------------------------
+if [ ! -d "$COMFY_DATA_DIR/ComfyUI/.git" ] && [ ! -f "$COMFY_DATA_DIR/ComfyUI/main.py" ]; then
+  echo "[start] Cloning ComfyUI into $COMFY_DATA_DIR/ComfyUI"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DATA_DIR/ComfyUI"
+fi
 
-# ---------- Launch ComfyUI headless ----------
-echo "[boot] starting ComfyUI headless…"
-python "${COMFY_DIR}/main.py" --disable-auto-launch --listen 127.0.0.1 --port 3000 &
+cd "$COMFY_DATA_DIR/ComfyUI"
 
-# Wait until API is up (max ~120s)
-echo "[boot] waiting for ComfyUI API…"
-for i in {1..240}; do
-  if curl -sf "http://127.0.0.1:3000/" >/dev/null; then
-    echo "[boot] ComfyUI API is up."
-    break
+# Optional: install WAN/VACE nodes here (commented to avoid delays)
+# mkdir -p custom_nodes
+# git clone --depth=1 https://github.com/Wan-2-2/ComfyUI-WAN22 custom_nodes/wan22 || true
+# git clone --depth=1 https://github.com/<org>/ComfyUI-VACE custom_nodes/vace || true
+
+# ---------------------------
+# Activate venv if exists
+# ---------------------------
+if [ -d "/venv" ]; then
+  source /venv/bin/activate
+fi
+
+# ---------------------------
+# Launch ComfyUI
+# ---------------------------
+HOST_ARG="--listen $COMFY_HOST"
+PORT_ARG="--port $COMFY_PORT"
+DATA_ARG="--data-dir $COMFY_DATA_DIR"
+
+echo "[start] Starting ComfyUI..."
+$PYTHON main.py $HOST_ARG $PORT_ARG $DATA_ARG $COMFY_ARGS > /tmp/comfyui.log 2>&1 &
+COMFY_PID=$!
+
+# ---------------------------
+# Health check
+# ---------------------------
+HEALTH_URL="http://127.0.0.1:$COMFY_PORT/system_stats"
+tries=0
+until curl -sf "$HEALTH_URL" >/dev/null 2>&1; do
+  tries=$((tries+1))
+  if [ "$tries" -ge "$HEALTH_RETRIES" ]; then
+    echo "[start][FATAL] ComfyUI failed to become healthy. Last 200 lines:"
+    tail -n 200 /tmp/comfyui.log || true
+    exit 1
   fi
-  sleep 0.5
+  echo "[start] Waiting for ComfyUI ($tries/$HEALTH_RETRIES)…"
+  sleep "$HEALTH_SLEEP"
 done
+echo "[start] ComfyUI is healthy."
 
-# ---------- Launch RunPod handler ----------
-echo "[boot] launching handler…"
-exec python -u /rp_handler.py
+# ---------------------------
+# Launch RunPod handler
+# ---------------------------
+cd /app
+if [ -f requirements.txt ]; then
+  echo "[start] Installing /app/requirements.txt (if any)…"
+  pip install -r requirements.txt >/tmp/reqs_install.log 2>&1 || true
+fi
+
+export RP_HANDLER_TIMEOUT
+echo "[start] Launching rp_handler.py"
+exec $PYTHON rp_handler.py
