@@ -11,10 +11,10 @@ set -euo pipefail
 # ---------------------------
 : "${COMFY_HOST:=0.0.0.0}"
 : "${COMFY_PORT:=8188}"
-: "${COMFY_DATA_DIR:=/workspace}"
+: "${COMFY_DATA_DIR:=/workspace}"         # data-dir for ComfyUI (outputs -> $COMFY_DATA_DIR/output)
 : "${COMFY_ARGS:=--disable-auto-launch}"
 : "${PYTHON:=python3}"
-: "${HEALTH_RETRIES:=90}"
+: "${HEALTH_RETRIES:=90}"                 # 90 * 2s = 3 minutes
 : "${HEALTH_SLEEP:=2}"
 : "${RP_HANDLER_TIMEOUT:=1800}"
 
@@ -25,13 +25,13 @@ echo "[start] COMFY_HOST=$COMFY_HOST COMFY_PORT=$COMFY_PORT DATA=$COMFY_DATA_DIR
 # ---------------------------
 # Ensure base folders
 # ---------------------------
-mkdir -p "$COMFY_DATA_DIR" \
-         "$COMFY_DATA_DIR/ComfyUI" \
-         "$COMFY_DATA_DIR/output"
+mkdir -p "$COMFY_DATA_DIR" "$COMFY_DATA_DIR/output"
 
+# Preferred network volume model layout
 for d in /runpod-volume/wan /runpod-volume/vae /runpod-volume/clip /runpod-volume/unet /runpod-volume/lora; do
   mkdir -p "$d" || true
 done
+# Local fallbacks
 mkdir -p /workspace/wan /workspace/vae /workspace/clip /workspace/unet /workspace/lora /workspace/comfywan/models/unet || true
 
 # ---------------------------
@@ -47,30 +47,27 @@ loras:       [/runpod-volume/lora, /workspace/lora]
 YAML
 
 # ---------------------------
-# Fetch ComfyUI if not already present
+# Ensure ComfyUI exists at /workspace/comfywan (image clones it here)
+# If missing (custom image), clone it now.
 # ---------------------------
-if [ ! -d "$COMFY_DATA_DIR/ComfyUI/.git" ] && [ ! -f "$COMFY_DATA_DIR/ComfyUI/main.py" ]; then
-  echo "[start] Cloning ComfyUI into $COMFY_DATA_DIR/ComfyUI"
-  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DATA_DIR/ComfyUI"
+if [ ! -f "/workspace/comfywan/main.py" ]; then
+  echo "[start] ComfyUI not found at /workspace/comfywan — cloning…"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
 fi
-
-cd "$COMFY_DATA_DIR/ComfyUI"
-
-# Optional: install WAN/VACE nodes here (commented to avoid delays)
-# mkdir -p custom_nodes
-# git clone --depth=1 https://github.com/Wan-2-2/ComfyUI-WAN22 custom_nodes/wan22 || true
-# git clone --depth=1 https://github.com/<org>/ComfyUI-VACE custom_nodes/vace || true
 
 # ---------------------------
 # Activate venv if exists
 # ---------------------------
 if [ -d "/venv" ]; then
+  # shellcheck disable=SC1091
   source /venv/bin/activate
 fi
 
 # ---------------------------
-# Launch ComfyUI
+# Launch ComfyUI headless
 # ---------------------------
+cd /workspace/comfywan
+
 HOST_ARG="--listen $COMFY_HOST"
 PORT_ARG="--port $COMFY_PORT"
 DATA_ARG="--data-dir $COMFY_DATA_DIR"
@@ -78,6 +75,9 @@ DATA_ARG="--data-dir $COMFY_DATA_DIR"
 echo "[start] Starting ComfyUI..."
 $PYTHON main.py $HOST_ARG $PORT_ARG $DATA_ARG $COMFY_ARGS > /tmp/comfyui.log 2>&1 &
 COMFY_PID=$!
+
+# Clean up on exit
+trap 'kill -TERM $COMFY_PID 2>/dev/null || true' EXIT
 
 # ---------------------------
 # Health check
@@ -97,14 +97,8 @@ done
 echo "[start] ComfyUI is healthy."
 
 # ---------------------------
-# Launch RunPod handler
+# Launch RunPod handler (handler lives at /rp_handler.py)
 # ---------------------------
-cd /app
-if [ -f requirements.txt ]; then
-  echo "[start] Installing /app/requirements.txt (if any)…"
-  pip install -r requirements.txt >/tmp/reqs_install.log 2>&1 || true
-fi
-
 export RP_HANDLER_TIMEOUT
 echo "[start] Launching rp_handler.py"
-exec $PYTHON rp_handler.py
+exec $PYTHON /rp_handler.py
