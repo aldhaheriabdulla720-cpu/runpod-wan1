@@ -1,8 +1,8 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Set this in RunPod Endpoint → Environment Variables (do NOT hardcode in Dockerfile)
-ENV HF_TOKEN=${HF_TOKEN}
+# Do NOT bake secrets in the image; HF_TOKEN will be provided at runtime by env
+# ENV HF_TOKEN=${HF_TOKEN}    # <-- intentionally not setting here
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-venv python3.10-dev python3-pip \
@@ -39,45 +39,11 @@ RUN pip install --no-cache-dir imageio-ffmpeg tqdm
 # Back to comfy root
 WORKDIR /workspace/comfywan
 
-# --- Runtime deps (RunPod handler etc.) ---
+# --- Runtime deps (handler etc.) ---
 RUN pip install --no-cache-dir runpod==1.7.9 requests websockets safetensors
 
-# --- WAN 2.2 models (requires HF token) ---
-# We rename to clear, short filenames AND create multiple symlinks to absorb legacy ckpt_name variants.
-RUN mkdir -p /workspace/models/diffusion_models /workspace/models/vae && \
-    aria2c -x 4 -s 4 \
-      --header="Authorization: Bearer ${HF_TOKEN}" \
-      -d /workspace/models/diffusion_models \
-      -o wan2.2-t2v-a14b.pth \
-      "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth?download=true" && \
-    aria2c -x 4 -s 4 \
-      --header="Authorization: Bearer ${HF_TOKEN}" \
-      -d /workspace/models/diffusion_models \
-      -o wan2.2-i2v-a14b.pth \
-      "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth?download=true" && \
-    aria2c -x 4 -s 4 \
-      --header="Authorization: Bearer ${HF_TOKEN}" \
-      -d /workspace/models/vae \
-      -o Wan2.1_VAE.pth \
-      "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/Wan2.1_VAE.pth?download=true" && \
-    # ---- Compatibility symlinks (common ckpt_name spellings) ----
-    cd /workspace/models/diffusion_models && \
-    ln -sf wan2.2-t2v-a14b.pth wan2.2.safetensors && \
-    ln -sf wan2.2-t2v-a14b.pth wan2.2.ckpt && \
-    ln -sf wan2.2-t2v-a14b.pth wan2.2.pth && \
-    ln -sf wan2.2-i2v-a14b.pth wan2.2-i2v.safetensors && \
-    ln -sf wan2.2-i2v-a14b.pth wan2.2-i2v.ckpt && \
-    ln -sf wan2.2-i2v-a14b.pth wan2.2-i2v.pth
-
-# --- Optional encoders (harmless; ignore failures) ---
-RUN mkdir -p /workspace/models/text_encoders && \
-    aria2c -x 4 -s 4 -d /workspace/models/text_encoders \
-      -o clip_text.pth \
-      "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin?download=true" || true
-RUN mkdir -p /workspace/models/clip_vision && \
-    aria2c -x 4 -s 4 -d /workspace/models/clip_vision \
-      -o clip_vision.pth \
-      "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/pytorch_model.bin?download=true" || true
+# --- WAN models ---
+# ⛔ Removed from Docker build. Download now happens at runtime in start.sh using HF_TOKEN.
 
 # --- Copy your repo files ---
 COPY start.sh /workspace/comfywan/start.sh
