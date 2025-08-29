@@ -14,15 +14,28 @@ WORKDIR /workspace
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 
-# ComfyUI
+# Clone ComfyUI
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
 WORKDIR /workspace/comfywan
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Runtime deps
-RUN pip install --no-cache-dir runpod==1.7.9 requests websockets pillow==10.3.0
+# --- Custom Nodes ---
+WORKDIR /workspace/comfywan/custom_nodes
+# GGUF loader (fixes UnetLoaderGGUF node)
+RUN git clone --depth=1 https://github.com/city96/ComfyUI-GGUF.git
+# Video helpers (video combine, writer, etc.)
+RUN git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
+RUN pip install --no-cache-dir imageio-ffmpeg tqdm
+# Manager (optional, but useful for troubleshooting)
+RUN git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager.git
 
-# Your repo files
+# Back to comfy root
+WORKDIR /workspace/comfywan
+
+# Runtime deps
+RUN pip install --no-cache-dir runpod==1.7.9 requests websockets pillow==10.3.0 safetensors
+
+# Copy your files
 COPY start.sh /workspace/comfywan/start.sh
 COPY rp_handler.py /workspace/comfywan/rp_handler.py
 COPY extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml
