@@ -1,36 +1,42 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Check if /runpod-volume exists
+# Prefer a Network Volume if present (keeps models between cold starts)
 if [ -d "/runpod-volume" ]; then
-  echo "Symlinking files from Network Volume"
+  echo "[boot] Using RunPod network volume at /runpod-volume"
   rm -rf /workspace && ln -s /runpod-volume /workspace
-  source /workspace/venv/bin/activate
-  echo "venv info:"
-  echo $VIRTUAL_ENV && python -V && which python && which pip
-  # Use libtcmalloc for better memory management
-  TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
-  export LD_PRELOAD="${TCMALLOC}"
-  export PYTHONUNBUFFERED=true
-  export HF_HOME="/workspace"
-  
-  cd /workspace/comfywan
-  
-  # Ensure ComfyUI-Manager runs in offline network mode inside the container
-  comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
-  
-  echo "worker-comfyui: Starting ComfyUI"
-  # Allow operators to tweak verbosity; default is INFO.
-  : "${COMFY_LOG_LEVEL:=INFO}"
-
-  # python main.py --port 3000 --use-sage-attention > /workspace/logs/comfywan.log 2>&1 &
-  # python main.py --use-sage-attention --listen 
-  # make sure to use full path. otherwise the base will change to /runpod-volume
-  python -u /workspace/comfywan/main.py --port 3000 --use-sage-attention --base-directory /workspace/comfywan --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
-  # deactivate
-
-  echo "worker-comfyui: Starting RunPod Handler"
-  python -u /rp_handler.py
+  mkdir -p /workspace/comfywan
 else
-  echo "Warning: /runpod-volume does not exist"
-  exit 1
+  echo "[boot] No network volume; using image filesystem at /workspace"
+  mkdir -p /workspace/comfywan
 fi
+
+# Nicer logs & HF cache
+export PYTHONUNBUFFERED=1
+export HF_HOME="/workspace/.cache/huggingface"
+
+# Make sure extra_model_paths.yaml exists in the Comfy root (where we cloned it)
+if [ ! -f /workspace/comfywan/extra_model_paths.yaml ] && [ -f /extra_model_paths.yaml ]; then
+  cp /extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml || true
+fi
+
+# Force ComfyUI-Manager offline to avoid git during serverless boots
+export COMFYUI_MANAGER_CONFIG=/workspace/comfywan/user/default/ComfyUI-Manager/config.ini
+mkdir -p "$(dirname "$COMFYUI_MANAGER_CONFIG")"
+grep -q '^network_mode' "$COMFYUI_MANAGER_CONFIG" 2>/dev/null \
+  && sed -i 's/^network_mode *=.*/network_mode = offline/' "$COMFYUI_MANAGER_CONFIG" \
+  || printf "[default]\nnetwork_mode = offline\n" > "$COMFYUI_MANAGER_CONFIG"
+
+# Start ComfyUI headless
+echo "[boot] Starting ComfyUI on 127.0.0.1:3000"
+python -u /workspace/comfywan/main.py \
+  --port 3000 \
+  --disable-auto-launch \
+  --disable-metadata \
+  --base-directory /workspace/comfywan \
+  --verbose INFO \
+  --log-stdout \
+  >/workspace/comfyui.log 2>&1 &
+
+# Start the RunPod handler (talks to ComfyUI over 127.0.0.1:3000)
+python -u /rp_handler.py
