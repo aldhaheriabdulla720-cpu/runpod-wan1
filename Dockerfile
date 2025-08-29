@@ -1,7 +1,6 @@
 # ComfyUI + WanVideoWrapper + VideoHelperSuite, ready for RunPod Serverless
 FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
-# ---- Env (no inline comments to avoid Docker parse errors)
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_PREFER_BINARY=1 \
@@ -49,8 +48,8 @@ RUN mkdir -p /workspace/comfywan/custom_nodes && \
     git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
       /workspace/comfywan/custom_nodes/ComfyUI-Manager
 
-# ---- Model path helper
-COPY extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml
+# ---- (Optional) ship a default extra_model_paths; start.sh will overwrite to volume if present
+COPY extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml || true
 
 # ---- Handler + launcher
 COPY rp_handler.py /rp_handler.py
@@ -58,5 +57,6 @@ COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
 EXPOSE 3000
-# Use CMD so RunPod “Container Start Command” can override (or leave blank)
+
+# RunPod will execute this; it calls our start.sh which launches rp_handler.py
 CMD ["bash", "/start.sh"]
