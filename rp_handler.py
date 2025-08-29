@@ -1,8 +1,7 @@
 # rp_handler.py — RunPod serverless handler for ComfyUI (video-ready)
-# Additions:
 # - Echo path: {"input":{"ping":"pong"}}  → immediate 200
 # - Dry-run path: {"input":{"dry_run": true}} → immediate 200
-# - Original Comfy workflow execution preserved
+# - Comfy workflow: {"input":{"workflow": {...}, "images":[...]?}}
 
 import os
 import json
@@ -15,33 +14,33 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import requests
-import websocket  # provided by image; no need for asyncio here
+import websocket  # provided by image
 import runpod
-from runpod.serverless.utils import rp_upload  # works when BUCKET_* env vars are set
+from runpod.serverless.utils import rp_upload  # for RETURN_MODE=url
 
 # ----------------------------- Config -----------------------------
 
 COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
-COMFY_PORT = int(os.getenv("COMFY_PORT", "3000"))
+COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))  # aligned with start.sh
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 PROMPT_URL = f"{COMFY_BASE}/prompt"
 VIEW_URL = f"{COMFY_BASE}/view"
 WS_URL = f"ws://{COMFY_HOST}:{COMFY_PORT}/ws"
 
-# where ComfyUI writes outputs; our start.sh launches Comfy with base at /workspace/comfywan
-OUTPUT_ROOT = Path(os.getenv("COMFY_OUTPUT_DIR", "/workspace/comfywan/output")).resolve()
+# outputs under --data-dir/output (start.sh sets data-dir=/workspace)
+OUTPUT_ROOT = Path(os.getenv("COMFY_OUTPUT_DIR", "/workspace/output")).resolve()
 
-# how long to wait for Comfy API to come up (headless boot)
+# how long to wait for API readiness
 API_CHECK_MAX_RETRIES = int(os.getenv("COMFY_API_AVAILABLE_MAX_RETRIES", "900"))
 API_CHECK_DELAY_MS = int(os.getenv("COMFY_API_CHECK_DELAY_MS", "50"))
 
-# websocket settings for long jobs
+# websocket + runtime
 WEBSOCKET_RECONNECT_ATTEMPTS = int(os.getenv("WEBSOCKET_RECONNECT_ATTEMPTS", "100"))
 WEBSOCKET_RECONNECT_DELAY_S = int(os.getenv("WEBSOCKET_RECONNECT_DELAY_S", "3"))
 WEBSOCKET_RECEIVE_TIMEOUT = int(os.getenv("WEBSOCKET_RECEIVE_TIMEOUT", "30"))
-MAX_EXECUTION_TIME = int(os.getenv("MAX_EXECUTION_TIME", "1800"))  # 30 minutes
+MAX_EXECUTION_TIME = int(os.getenv("MAX_EXECUTION_TIME", "1800"))
 
-# output mode: "base64" (default) or "url" (requires bucket envs)
+# output response mode
 RETURN_MODE = os.getenv("RETURN_MODE", "base64").lower()
 
 # cleanup behavior
@@ -50,7 +49,7 @@ VIDEO_EXTS = {".mp4", ".webm", ".gif"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 CLEANABLE_EXTS = VIDEO_EXTS | IMAGE_EXTS
 
-# optional callback webhook if you want (leave empty to disable)
+# optional callback
 CALLBACK_API_ENDPOINT = os.getenv("CALLBACK_API_ENDPOINT", "")
 CALLBACK_API_SECRET = os.getenv("CALLBACK_API_SECRET", "")
 
@@ -108,7 +107,6 @@ def cleanup_outputs(paths: List[str]) -> None:
     log(f"cleanup done, removed={removed}")
 
 def try_decode_b64uri(data_uri: str) -> bytes:
-    # accept data:...;base64,.... or plain base64
     if "," in data_uri and data_uri.strip().lower().startswith("data:"):
         data_uri = data_uri.split(",", 1)[1]
     return base64.b64decode(data_uri)
@@ -135,7 +133,6 @@ def validate_and_prepare(job_input: Any) -> Tuple[Dict[str, Any], str]:
     if workflow is None:
         return None, "Missing 'workflow' parameter"
 
-    # Must be an object, not a stringified JSON
     if isinstance(workflow, str):
         try:
             workflow = json.loads(workflow)
@@ -154,7 +151,6 @@ def validate_and_prepare(job_input: Any) -> Tuple[Dict[str, Any], str]:
 # ------------------------- Comfy interactions -------------------------
 
 def upload_init_images(images: List[Dict[str, str]]) -> None:
-    """Upload init images to ComfyUI via /upload (if your workflow references them)."""
     for img in images:
         name = img["name"]
         b = try_decode_b64uri(img["image"])
@@ -165,7 +161,6 @@ def upload_init_images(images: List[Dict[str, str]]) -> None:
         log(f"uploaded init image: {name}")
 
 def queue_prompt(workflow: Dict[str, Any], client_id: str) -> str:
-    """POST the workflow to /prompt and return the prompt_id."""
     payload = {"prompt": workflow, "client_id": client_id}
     r = requests.post(PROMPT_URL, json=payload, timeout=120)
     if r.status_code != 200:
@@ -177,7 +172,6 @@ def queue_prompt(workflow: Dict[str, Any], client_id: str) -> str:
     return prompt_id
 
 def ws_listen(client_id: str, prompt_id: str) -> List[Dict[str, Any]]:
-    """Connect to websocket and collect 'executed' messages for this prompt_id."""
     outputs = []
     attempts = 0
     start_time = time.time()
@@ -194,7 +188,6 @@ def ws_listen(client_id: str, prompt_id: str) -> List[Dict[str, Any]]:
                 try:
                     msg = ws.recv()
                 except websocket.WebSocketTimeoutException:
-                    # keep alive
                     continue
 
                 if not msg:
@@ -223,7 +216,6 @@ def ws_listen(client_id: str, prompt_id: str) -> List[Dict[str, Any]]:
     raise RuntimeError("Websocket reconnect attempts exhausted.")
 
 def collect_artifacts(outputs_msgs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Parse 'executed' messages and build a list of artifacts descriptors."""
     artifacts: List[Dict[str, str]] = []
     for msg in outputs_msgs:
         d = msg.get("data", {})
@@ -238,7 +230,7 @@ def collect_artifacts(outputs_msgs: List[Dict[str, Any]]) -> List[Dict[str, str]
                     if not fn:
                         continue
                     ext = Path(fn).suffix.lower()
-                    kind = "video" if ext in VIDEO_EXTS else "image"
+                    kind = "video" if ext in {".mp4", ".webm", ".gif"} else "image"
                     artifacts.append({
                         "type": kind,
                         "subfolder": it.get("subfolder", ""),
@@ -254,15 +246,8 @@ def read_file_b64(local_path: str) -> str:
 # ------------------------------ Handler ------------------------------
 
 def handler(job):
-    """
-    RunPod entrypoint. Supports:
-      1) Echo:   {"input":{"ping":"pong"}}
-      2) Dry-run {"input":{"dry_run": true}}
-      3) Comfy:  {"input":{"workflow": {...}, "images":[...]?}}
-    """
     job_id = job.get("id") or str(uuid.uuid4())
     try:
-        # --------- Fast paths: echo / dry_run ---------
         raw_input = job.get("input") or {}
         if isinstance(raw_input, str):
             try:
@@ -272,12 +257,10 @@ def handler(job):
 
         if isinstance(raw_input, dict):
             if "ping" in raw_input:
-                # Plain echo for health/latency checks
                 return {"status": "ok", "echo": raw_input.get("ping")}
             if raw_input.get("dry_run"):
                 return {"status": "ok", "message": "dry_run"}
 
-        # --------- Normal Comfy path ---------
         validated, err = validate_and_prepare(raw_input)
         if err:
             return {"error": err}
@@ -285,30 +268,28 @@ def handler(job):
         workflow = validated["workflow"]
         images = validated.get("images") or []
 
-        # Ensure API up
         if not check_server(f"{COMFY_BASE}/", retries=API_CHECK_MAX_RETRIES, delay_ms=API_CHECK_DELAY_MS):
             return {"error": f"Comfy API not reachable at {COMFY_BASE}"}
 
-        # Upload init images if provided
         if images:
             upload_init_images(images)
 
-        # Queue prompt
         client_id = str(uuid.uuid4())
         prompt_id = queue_prompt(workflow, client_id)
         log(f"queued prompt_id={prompt_id}")
 
-        callback_api({"action": "queued", "job_id": job_id, "prompt_id": prompt_id})
+        # optional callback
+        if CALLBACK_API_ENDPOINT:
+            callback_api({"action": "queued", "job_id": job_id, "prompt_id": prompt_id})
 
-        # Listen for execution
         executed_msgs = ws_listen(client_id, prompt_id)
         artifacts = collect_artifacts(executed_msgs)
 
         if not artifacts:
-            callback_api({"action": "complete", "job_id": job_id, "result": {"status": "success_no_outputs", "artifacts": []}})
+            if CALLBACK_API_ENDPOINT:
+                callback_api({"action": "complete", "job_id": job_id, "result": {"status": "success_no_outputs", "artifacts": []}})
             return {"status": "success_no_outputs", "artifacts": []}
 
-        # Build response and cleanup list
         just_produced_files: List[str] = []
         results: List[Dict[str, Any]] = []
 
@@ -337,23 +318,20 @@ def handler(job):
                     "base64": b64
                 })
 
-        response = {
-            "status": "success",
-            "artifacts": results
-        }
-
+        resp = {"status": "success", "artifacts": results}
         cleanup_outputs(just_produced_files)
-        callback_api({"action": "complete", "job_id": job_id, "result": {"status": "success", "count": len(results)}})
-        return response
+        if CALLBACK_API_ENDPOINT:
+            callback_api({"action": "complete", "job_id": job_id, "result": {"status": "success", "count": len(results)}})
+        return resp
 
     except Exception as e:
         tb = traceback.format_exc()
         log(f"ERROR: {e}\n{tb}")
-        callback_api({"action": "error", "job_id": job_id, "error": str(e)})
+        if CALLBACK_API_ENDPOINT:
+            callback_api({"action": "error", "job_id": job_id, "error": str(e)})
         return {"error": str(e)}
 
 # ------------------------------ Bootstrap ----------------------------
-
 if __name__ == "__main__":
     log("Starting RunPod serverless handler…")
     runpod.serverless.start({"handler": handler})
