@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu12
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
 WORKDIR /workspace/comfywan
 
-# Safe pins + ComfyUI deps
+# --- Base Python deps for ComfyUI ---
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     pillow==10.3.0 \
@@ -29,21 +29,25 @@ RUN pip install --no-cache-dir \
     tokenizers==0.15.2 \
  && pip install --no-cache-dir -r requirements.txt
 
-# --- Custom Nodes ---
+# --- Add huggingface_hub (for WAN 2.2 sharded downloads at runtime) ---
+RUN pip install --no-cache-dir huggingface_hub==0.25.2
+
+# --- Custom Nodes (optional but commonly used for video workflows) ---
 WORKDIR /workspace/comfywan/custom_nodes
 RUN git clone --depth=1 https://github.com/city96/ComfyUI-GGUF.git
 RUN git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 RUN git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager.git
 RUN pip install --no-cache-dir imageio-ffmpeg tqdm
 
-# Back to comfy root
+# Back to ComfyUI root
 WORKDIR /workspace/comfywan
 
 # --- Runtime deps (handler etc.) ---
 RUN pip install --no-cache-dir runpod==1.7.9 requests websockets safetensors
 
 # --- WAN models ---
-# ⛔ Removed from Docker build. Download now happens at runtime in start.sh using HF_TOKEN.
+# ⛔ Intentionally NOT downloaded at build time.
+#    Downloads happen at runtime in start.sh using HF_TOKEN/HUGGINGFACE_HUB_TOKEN.
 
 # --- Copy your repo files ---
 COPY start.sh /workspace/comfywan/start.sh
