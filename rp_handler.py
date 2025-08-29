@@ -1,16 +1,17 @@
-import os, json, base64, time, glob, requests, runpod
+import os, json, time, base64, glob, requests, runpod
+from typing import Any, Dict, List
 
-COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
+# Always call loopback (127.0.0.1). Bind may be 0.0.0.0, that's fine.
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
-COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
+COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/output")
 WORKFLOWS_DIR = os.getenv("WORKFLOWS_DIR", "/workspace/comfywan/workflows")
-RETURN_MODE = os.getenv("RETURN_MODE", "base64")
+RETURN_MODE = os.getenv("RETURN_MODE", "base64")  # base64 | path
 
 CALLBACK_ENDPOINT = os.getenv("CALLBACK_API_ENDPOINT")
-CALLBACK_SECRET = os.getenv("CALLBACK_API_SECRET")
+CALLBACK_SECRET   = os.getenv("CALLBACK_API_SECRET")
 
-def send_callback(payload):
+def _cb(payload: Dict[str, Any]):
     if not CALLBACK_ENDPOINT:
         return
     headers = {"Content-Type": "application/json"}
@@ -19,97 +20,118 @@ def send_callback(payload):
     try:
         requests.post(CALLBACK_ENDPOINT, json=payload, headers=headers, timeout=10)
     except Exception as e:
-        print("[callback] Failed:", e)
+        print("[callback] failed:", e)
 
-def load_workflow(workflow):
-    # Accept dict, shortname, or filename
-    if isinstance(workflow, dict):
-        return workflow
-    if not isinstance(workflow, str):
-        raise ValueError("workflow must be dict or str")
-    # Normalize name
-    name = workflow.strip()
-    if name.endswith(".json"):
-        path = os.path.join(WORKFLOWS_DIR, name)
+def _load_workflow(ref: Any) -> Dict[str, Any]:
+    """
+    Accepts:
+      - dict: returned as-is
+      - short name: 'ping' or 'wan2.2-t2v' -> loads WORKFLOWS_DIR/<name>.json
+      - filename:  'wan2.2-t2v.json'
+    """
+    if isinstance(ref, dict):
+        return ref
+    if not isinstance(ref, str):
+        raise ValueError("workflow must be dict or string")
+
+    candidates: List[str] = []
+    if ref.endswith(".json"):
+        candidates.append(os.path.join(WORKFLOWS_DIR, ref))
     else:
-        path = os.path.join(WORKFLOWS_DIR, f"{name}.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Workflow not found: {path}")
-    with open(path, "r") as f:
-        return json.load(f)
+        candidates.append(os.path.join(WORKFLOWS_DIR, f"{ref}.json"))
 
-def inject_inputs(workflow, inputs):
-    # Replace image node if base64 or URL given
-    if "image_b64" in inputs:
-        b64 = inputs["image_b64"]
-        img_path = os.path.join(OUTPUT_DIR, "input_image.png")
-        with open(img_path, "wb") as f:
-            f.write(base64.b64decode(b64))
-        for node in workflow.values():
-            if node.get("class_type", "").lower() in ["loadimage", "load image"]:
-                node["inputs"]["image"] = img_path
-    if "image_url" in inputs:
-        url = inputs["image_url"]
-        img_path = os.path.join(OUTPUT_DIR, "input_image.png")
-        data = requests.get(url, timeout=30).content
-        with open(img_path, "wb") as f:
-            f.write(data)
-        for node in workflow.values():
-            if node.get("class_type", "").lower() in ["loadimage", "load image"]:
-                node["inputs"]["image"] = img_path
-    return workflow
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
 
-def run_workflow(workflow, prompt_id="job"):
-    payload = {"prompt": workflow}
-    r = requests.post(f"{COMFY_URL}/prompt", json=payload)
-    r.raise_for_status()
-    return r.json()
+    raise FileNotFoundError(f"workflow '{ref}' not found in {WORKFLOWS_DIR}")
+
+def _validate_workflow(wf: Dict[str, Any]):
+    if not isinstance(wf, dict) or not wf:
+        raise ValueError("workflow is empty or not a dict")
+    # Each key is a node id; each node must have class_type and inputs
+    for node_id, node in wf.items():
+        if not isinstance(node, dict):
+            raise ValueError(f"node {node_id} is not an object")
+        if "class_type" not in node:
+            raise ValueError(f"node {node_id} missing class_type")
+        if "inputs" not in node:
+            raise ValueError(f"node {node_id} missing inputs")
+
+def _post_prompt(prompt: Dict[str, Any]) -> str:
+    r = requests.post(f"{COMFY_URL}/prompt", json=prompt, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"ComfyUI /prompt bad status {r.status_code}: {r.text}")
+    data = r.json()
+    return data.get("prompt_id") or data.get("number") or ""
+
+def _poll(prompt_id: str, timeout_s: int = 1800) -> Dict[str, Any]:
+    t0 = time.time()
+    while True:
+        if time.time() - t0 > timeout_s:
+            raise TimeoutError("execution timed out")
+        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data and prompt_id in data:
+                return data[prompt_id]
+        time.sleep(1.5)
+
+def _collect_outputs(limit: int = 8) -> List[str]:
+    exts = ("*.mp4", "*.webm", "*.png", "*.gif", "*.jpg", "*.jpeg")
+    files: List[str] = []
+    for pattern in exts:
+        files += glob.glob(os.path.join(OUTPUT_DIR, pattern))
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[:limit]
+
+def _serialize(file_path: str) -> Dict[str, str]:
+    if RETURN_MODE == "base64":
+        with open(file_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return {"filename": os.path.basename(file_path), "type": "base64", "data": b64}
+    else:
+        return {"filename": os.path.basename(file_path), "type": "path", "data": file_path}
 
 def handler(event):
-    inp = event.get("input", {})
-    wf = inp.get("workflow")
-    if not wf:
-        return {"error": "Missing 'workflow'"}
-    # Load + inject
-    try:
-        workflow = load_workflow(wf)
-        workflow = inject_inputs(workflow, inp)
-    except Exception as e:
-        return {"error": str(e)}
+    """
+    Input:
+    {
+      "workflow": dict | "ping" | "wan2.2-t2v" | "wan2.2-t2v.json",
+      "inputs":   {...},       # reserved for future prompt/img injection
+      "client_id":"abc",       # optional
+      "dry_run":  false        # optional - validate only
+    }
+    """
+    payload = event.get("input") or {}
+    workflow_ref = payload.get("workflow", "ping")
+    inputs = payload.get("inputs", {})  # not used yet
+    client_id = payload.get("client_id", "serverless")
+    dry_run = bool(payload.get("dry_run", False))
 
-    prompt_id = f"sync-{event['id']}"
-    send_callback({"action": "in_queue", "prompt_id": prompt_id})
+    # Load + validate
+    wf = _load_workflow(workflow_ref)
+    _validate_workflow(wf)
 
-    try:
-        run_workflow(workflow, prompt_id)
-    except Exception as e:
-        send_callback({"action": "error", "prompt_id": prompt_id, "errors": str(e)})
-        return {"error": str(e)}
+    if dry_run:
+        return {"ok": True, "validated": True, "workflow_nodes": len(wf)}
 
-    # Wait for outputs
-    start = time.time()
-    result_files = []
-    while time.time() - start < int(os.getenv("MAX_EXECUTION_TIME", 1800)):
-        files = glob.glob(os.path.join(OUTPUT_DIR, "*.mp4"))
-        if files:
-            result_files = files
-            break
-        time.sleep(5)
+    # ComfyUI expects {"prompt": <graph>, "client_id": "..."}
+    prompt = {"prompt": wf, "client_id": client_id}
 
-    if not result_files:
-        send_callback({"action": "error", "prompt_id": prompt_id, "errors": "Timeout waiting for outputs"})
-        return {"error": "Timeout waiting for outputs"}
+    # Submit
+    prompt_id = _post_prompt(prompt)
+    _cb({"action": "in_queue", "prompt_id": prompt_id})
 
-    outputs = []
-    for fpath in result_files:
-        if RETURN_MODE == "base64":
-            with open(fpath, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            outputs.append({"filename": os.path.basename(fpath), "type": "base64", "data": b64})
-        else:
-            outputs.append({"filename": os.path.basename(fpath), "type": "path", "data": fpath})
+    # Poll for completion
+    result = _poll(prompt_id, timeout_s=int(os.getenv("MAX_EXECUTION_TIME", "1800")))
 
-    send_callback({"action": "complete", "prompt_id": prompt_id, "result": {"videos": outputs}})
-    return {"outputs": outputs}
+    # Gather outputs
+    files = _collect_outputs()
+    outputs = [_serialize(p) for p in files]
+
+    _cb({"action": "complete", "prompt_id": prompt_id, "result": {"outputs": outputs}})
+    return {"outputs": outputs, "history": result}
 
 runpod.serverless.start({"handler": handler})
