@@ -15,7 +15,7 @@ fi
 export PYTHONUNBUFFERED=1
 export HF_HOME="/workspace/.cache/huggingface"
 
-# Make sure extra_model_paths.yaml exists in the Comfy root (where we cloned it)
+# Make sure extra_model_paths.yaml exists in the Comfy root
 if [ ! -f /workspace/comfywan/extra_model_paths.yaml ] && [ -f /extra_model_paths.yaml ]; then
   cp /extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml || true
 fi
@@ -28,12 +28,26 @@ mkdir -p /runpod-volume/{wan,vae,clip,lora}
 
 if [ "${WAN_BOOT_FETCH:-0}" = "1" ]; then
   echo "[boot] Checking WAN models..."
+
+  # WAN T2V
   [ -f /runpod-volume/wan/wan2.2.pth ] || aria2c -x16 -s16 -k1M -d /runpod-volume/wan \
     -o wan2.2.pth "${WAN22_MODEL_URL:-}"
+
+  # VAE
   [ -f /runpod-volume/vae/wan_vae_b.pth ] || aria2c -x16 -s16 -k1M -d /runpod-volume/vae \
     -o wan_vae_b.pth "${VAE_URL:-}"
-  [ -f /runpod-volume/clip/openclip_vith14.safetensors ] || aria2c -x16 -s16 -k1M -d /runpod-volume/clip \
-    -o openclip_vith14.safetensors "${CLIP_URL:-}"
+
+  # CLIP shards
+  for i in 1 2 3 4 5 6; do
+    url_var="CLIP_URL_${i}"
+    fname="clip_part_${i}.safetensors"
+    if [ -n "${!url_var:-}" ]; then
+      [ -f /runpod-volume/clip/$fname ] || aria2c -x16 -s16 -k1M -d /runpod-volume/clip \
+        -o $fname "${!url_var}"
+    fi
+  done
+
+  # LoRA (optional)
   if [ -n "${LORA1_URL:-}" ]; then
     [ -f /runpod-volume/lora/cinematic_vibes.safetensors ] || aria2c -x16 -s16 -k1M -d /runpod-volume/lora \
       -o cinematic_vibes.safetensors "$LORA1_URL"
