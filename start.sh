@@ -17,7 +17,8 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/workspace/.cache}"
 
-mkdir -p "$COMFY_DATA_DIR" "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" /tmp
+# Make sure all directories exist, including /workspace/output
+mkdir -p "$COMFY_DATA_DIR/output" "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" /tmp
 
 # ---------- launch ComfyUI in background ----------
 log "Starting ComfyUI from $COMFY_APP ..."
@@ -25,7 +26,7 @@ cd "$COMFY_APP"
 
 HOST_ARG=(--listen "$COMFY_HOST")
 PORT_ARG=(--port "$COMFY_PORT")
-OUTPUT_ARG=(--output-directory "$COMFY_DATA_DIR")
+OUTPUT_ARG=(--output-directory "$COMFY_DATA_DIR/output")
 
 echo "[start] ComfyUI launching..." > /tmp/comfyui.log
 python3 main.py "${HOST_ARG[@]}" "${PORT_ARG[@]}" "${OUTPUT_ARG[@]}" $COMFY_ARGS >> /tmp/comfyui.log 2>&1 &
