@@ -1,6 +1,10 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Add HF_TOKEN as an environment variable (set in RunPod Endpoint envs)
+ENV HF_TOKEN=${HF_TOKEN}
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-venv python3.10-dev python3-pip \
     git curl aria2 wget ca-certificates ffmpeg \
@@ -42,33 +46,34 @@ WORKDIR /workspace/comfywan
 # --- Runtime deps ---
 RUN pip install --no-cache-dir runpod==1.7.9 requests websockets safetensors
 
-# --- Preload WAN 2.2 + VACE weights ---
-# Diffusion models (WAN 2.2 + VACE)
+# --- Preload WAN 2.2 + VACE weights (requires HF token) ---
 RUN mkdir -p /workspace/models/diffusion_models && \
-    aria2c -x 4 -s 4 -d /workspace/models/diffusion_models \
+    aria2c -x 4 -s 4 \
+      --header="Authorization: Bearer ${HF_TOKEN}" \
+      -d /workspace/models/diffusion_models \
       -o wan2.2.safetensors \
       "https://huggingface.co/city96/WAN2.2/resolve/main/wan2.2.safetensors?download=true" && \
-    aria2c -x 4 -s 4 -d /workspace/models/diffusion_models \
+    aria2c -x 4 -s 4 \
+      --header="Authorization: Bearer ${HF_TOKEN}" \
+      -d /workspace/models/diffusion_models \
       -o vace.safetensors \
       "https://huggingface.co/city96/VACE/resolve/main/vace.safetensors?download=true"
 
-# VAE
+# --- Public models (no auth needed) ---
 RUN mkdir -p /workspace/models/vae && \
     aria2c -x 4 -s 4 -d /workspace/models/vae \
       -o vae-ft-mse-840000-ema-pruned.safetensors \
       "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors?download=true"
 
-# CLIP text encoder
 RUN mkdir -p /workspace/models/text_encoders && \
     aria2c -x 4 -s 4 -d /workspace/models/text_encoders \
       -o clip_text.pth \
-      "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/clip_text.pth?download=true"
+      "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin?download=true"
 
-# CLIP vision encoder
 RUN mkdir -p /workspace/models/clip_vision && \
     aria2c -x 4 -s 4 -d /workspace/models/clip_vision \
       -o clip_vision.pth \
-      "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/clip_vision.pth?download=true"
+      "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/pytorch_model.bin?download=true"
 
 # --- Copy your repo files ---
 COPY start.sh /workspace/comfywan/start.sh
