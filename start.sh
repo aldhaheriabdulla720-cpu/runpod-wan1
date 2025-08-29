@@ -5,9 +5,9 @@ echo "[boot] starting worker…"
 
 APP_DIR="/workspace"
 COMFY_DIR="${APP_DIR}/comfywan"
-VOLUME_DIR="/runpod-volume"
+VOLUME_DIR="/runpod-volume"   # RunPod network volume (if mounted)
 
-# -------- Cache dirs (same as before) --------
+# ---------- Cache dirs ----------
 if [[ -d "${VOLUME_DIR}" ]]; then
   echo "[boot] network volume detected at ${VOLUME_DIR}"
   export HF_HOME="${VOLUME_DIR}/hf"
@@ -25,7 +25,7 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_ENABLE_HF_TRANSFER=1
 mkdir -p "${TRANSFORMERS_CACHE}" "${TORCH_HOME}" "${WAN_CACHE}" || true
 
-# ComfyUI extra model paths (same mapping you had)
+# ---------- ComfyUI model paths (persist on volume if present) ----------
 mkdir -p /root/.config/ComfyUI
 cat > /root/.config/ComfyUI/extra_model_paths.yaml <<'YAML'
 checkpoints: [/runpod-volume/wan, /workspace/wan]
@@ -34,16 +34,18 @@ clip:        [/runpod-volume/clip, /workspace/clip]
 loras:       [/runpod-volume/lora, /workspace/lora]
 YAML
 
+# ---------- Diagnostics ----------
 python -V || true
+echo "[boot] CUDA from base image (if present):"
 command -v nvidia-smi >/dev/null && nvidia-smi || echo "(nvidia-smi not present in runtime)"
 
-# -------- Launch ComfyUI headless --------
+# ---------- Launch ComfyUI headless ----------
 echo "[boot] starting ComfyUI headless…"
 python "${COMFY_DIR}/main.py" --disable-auto-launch --listen 127.0.0.1 --port 3000 &
 
-# Wait for API to come up quickly
+# Wait until API is up (max ~120s)
 echo "[boot] waiting for ComfyUI API…"
-for i in {1..120}; do
+for i in {1..240}; do
   if curl -sf "http://127.0.0.1:3000/" >/dev/null; then
     echo "[boot] ComfyUI API is up."
     break
@@ -51,6 +53,6 @@ for i in {1..120}; do
   sleep 0.5
 done
 
-# -------- Launch RunPod handler --------
+# ---------- Launch RunPod handler ----------
 echo "[boot] launching handler…"
 exec python -u /rp_handler.py
