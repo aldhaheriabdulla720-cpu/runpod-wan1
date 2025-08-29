@@ -21,7 +21,6 @@ mkdir -p "$OUTPUT_DIR" /workspace/logs "$DIFF_DIR" "$VAE_DIR"
 # ---------------------------
 # Network Volume (optional) → persist models
 # ---------------------------
-# If a RunPod Network Volume is mounted at /runpod-volume, link its /models folder.
 if [ -d "/runpod-volume" ]; then
   mkdir -p /runpod-volume/models
   if [ ! -L "$MODELS_ROOT" ]; then
@@ -45,7 +44,7 @@ dl_if_missing() {
   local url="$1" out="$2" min_bytes="$3" header=""
   if [[ "$url" == https://huggingface.co/* ]]; then
     if [ -z "${HF_TOKEN:-}" ]; then
-      echo "[start] ERROR: HF_TOKEN not set but need to download $out"
+      echo "[start] ERROR: HF_TOKEN not set but need to download $(basename "$out")"
       exit 1
     fi
     header="--header=Authorization: Bearer ${HF_TOKEN}"
@@ -54,10 +53,10 @@ dl_if_missing() {
   if [ -f "$out" ]; then
     local sz; sz=$(stat -c %s "$out" || echo 0)
     if [ "$sz" -ge "$min_bytes" ]; then
-      echo "[start] Found $out ($sz bytes) ✔"
+      echo "[start] Found $(basename "$out") ($sz bytes) ✔"
       return 0
     else
-      echo "[start] $out exists but too small ($sz < $min_bytes). Re-downloading…"
+      echo "[start] $(basename "$out") exists but too small ($sz < $min_bytes). Re-downloading…"
       rm -f "$out"
     fi
   fi
@@ -74,11 +73,11 @@ dl_if_missing() {
 }
 
 # WAN 2.2 (A14B) expected sizes (rough guards)
-# main pth ~11GB → use 8GB guard; VAE ~508MB → use 200MB guard
 T2V_OUT="${DIFF_DIR}/wan2.2-t2v-a14b.pth"
 I2V_OUT="${DIFF_DIR}/wan2.2-i2v-a14b.pth"
 VAE_OUT="${VAE_DIR}/Wan2.1_VAE.pth"
 
+# main pth ~11GB → guard 8GB; VAE ~508MB → guard 200MB
 dl_if_missing "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth?download=true" \
               "$T2V_OUT" $((8*1024*1024*1024))
 dl_if_missing "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth?download=true" \
@@ -86,7 +85,7 @@ dl_if_missing "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/models
 dl_if_missing "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/Wan2.1_VAE.pth?download=true" \
               "$VAE_OUT" $((200*1024*1024))
 
-# Compatibility symlinks to absorb legacy ckpt_name values
+# Compatibility symlinks (absorb legacy ckpt_name values)
 (
   cd "$DIFF_DIR"
   ln -sf wan2.2-t2v-a14b.pth wan2.2.safetensors || true
@@ -101,7 +100,6 @@ dl_if_missing "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/Wan2.1
 # Launch ComfyUI headless
 # ---------------------------
 cd "$COMFY_APP"
-
 HOST_ARG="--listen $COMFY_HOST"
 PORT_ARG="--port $COMFY_PORT"
 OUT_ARG="--output-directory $OUTPUT_DIR"
