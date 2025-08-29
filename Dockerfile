@@ -1,8 +1,7 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-
-# Add HF_TOKEN as an environment variable (set in RunPod Endpoint envs)
+# Set at RunPod → Endpoint → Environment Variables
 ENV HF_TOKEN=${HF_TOKEN}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,12 +31,9 @@ RUN pip install --no-cache-dir \
 
 # --- Custom Nodes ---
 WORKDIR /workspace/comfywan/custom_nodes
-# GGUF loader (fixes UnetLoaderGGUF node)
 RUN git clone --depth=1 https://github.com/city96/ComfyUI-GGUF.git
-# Video helpers (video combine, writer, etc.)
 RUN git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 RUN pip install --no-cache-dir imageio-ffmpeg tqdm
-# Manager (optional, but useful for troubleshooting)
 RUN git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager.git
 
 # Back to comfy root
@@ -46,34 +42,37 @@ WORKDIR /workspace/comfywan
 # --- Runtime deps ---
 RUN pip install --no-cache-dir runpod==1.7.9 requests websockets safetensors
 
-# --- Preload WAN 2.2 + VACE weights (requires HF token) ---
-RUN mkdir -p /workspace/models/diffusion_models && \
+# --- WAN 2.2 models (requires HF token) ---
+# We download the exact filenames shown on the HF pages you shared:
+# - models_t5_umt5-xxl-enc-bf16.pth (main checkpoint)
+# - Wan2.1_VAE.pth (VAE)
+RUN mkdir -p /workspace/models/diffusion_models /workspace/models/vae && \
     aria2c -x 4 -s 4 \
       --header="Authorization: Bearer ${HF_TOKEN}" \
       -d /workspace/models/diffusion_models \
-      -o wan2.2.safetensors \
-      "https://huggingface.co/city96/WAN2.2/resolve/main/wan2.2.safetensors?download=true" && \
+      -o wan2.2-t2v-a14b.pth \
+      "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth?download=true" && \
     aria2c -x 4 -s 4 \
       --header="Authorization: Bearer ${HF_TOKEN}" \
       -d /workspace/models/diffusion_models \
-      -o vace.safetensors \
-      "https://huggingface.co/city96/VACE/resolve/main/vace.safetensors?download=true"
+      -o wan2.2-i2v-a14b.pth \
+      "https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth?download=true" && \
+    aria2c -x 4 -s 4 \
+      --header="Authorization: Bearer ${HF_TOKEN}" \
+      -d /workspace/models/vae \
+      -o Wan2.1_VAE.pth \
+      "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/resolve/main/Wan2.1_VAE.pth?download=true"
 
-# --- Public models (no auth needed) ---
-RUN mkdir -p /workspace/models/vae && \
-    aria2c -x 4 -s 4 -d /workspace/models/vae \
-      -o vae-ft-mse-840000-ema-pruned.safetensors \
-      "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors?download=true"
-
+# --- Optional: public encoders (harmless to keep) ---
 RUN mkdir -p /workspace/models/text_encoders && \
     aria2c -x 4 -s 4 -d /workspace/models/text_encoders \
       -o clip_text.pth \
-      "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin?download=true"
+      "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/pytorch_model.bin?download=true" || true
 
 RUN mkdir -p /workspace/models/clip_vision && \
     aria2c -x 4 -s 4 -d /workspace/models/clip_vision \
       -o clip_vision.pth \
-      "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/pytorch_model.bin?download=true"
+      "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/pytorch_model.bin?download=true" || true
 
 # --- Copy your repo files ---
 COPY start.sh /workspace/comfywan/start.sh
