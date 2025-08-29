@@ -1,67 +1,53 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/bash
+set -e
 
-log() { printf "[start] %s\n" "$*" >&2; }
+# ---------------------------
+# Environment defaults
+# ---------------------------
+export COMFY_APP=${COMFY_APP:-/workspace/comfywan}
+export COMFY_HOST=${COMFY_HOST:-0.0.0.0}
+export COMFY_PORT=${COMFY_PORT:-8188}
+export OUTPUT_DIR=${OUTPUT_DIR:-/workspace/output}
+export RETURN_MODE=${RETURN_MODE:-base64}
+export WORKFLOWS_DIR=${WORKFLOWS_DIR:-$COMFY_APP/workflows}
+export MAX_EXECUTION_TIME=${MAX_EXECUTION_TIME:-1800}
 
-# ---------- env sanity ----------
-: "${COMFY_APP:?COMFY_APP is required (folder with ComfyUI main.py)}}"
-: "${COMFY_HOST:=0.0.0.0}"
-: "${COMFY_PORT:=8188}"
-: "${COMFY_DATA_DIR:=/workspace}"
-: "${COMFY_ARGS:=--disable-auto-launch}"
-: "${RUNPOD_HANDLER_PATH:=/workspace/rp_handler.py}"
+mkdir -p "$OUTPUT_DIR" /workspace/logs
 
-export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
-export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
-export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/workspace/.cache}"
-
-# Make sure all directories exist, including /workspace/output
-mkdir -p "$COMFY_DATA_DIR/output" "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" /tmp
-
-# ---------- launch ComfyUI in background ----------
-log "Starting ComfyUI from $COMFY_APP ..."
+# ---------------------------
+# Launch ComfyUI headless
+# ---------------------------
 cd "$COMFY_APP"
 
-HOST_ARG=(--listen "$COMFY_HOST")
-PORT_ARG=(--port "$COMFY_PORT")
-OUTPUT_ARG=(--output-directory "$COMFY_DATA_DIR/output")
+HOST_ARG="--listen $COMFY_HOST"
+PORT_ARG="--port $COMFY_PORT"
+OUT_ARG="--output-directory $OUTPUT_DIR"
+ARGS="--disable-auto-launch"
 
-echo "[start] ComfyUI launching..." > /tmp/comfyui.log
-python3 main.py "${HOST_ARG[@]}" "${PORT_ARG[@]}" "${OUTPUT_ARG[@]}" $COMFY_ARGS >> /tmp/comfyui.log 2>&1 &
+echo "[start] Starting ComfyUI..."
+python main.py $HOST_ARG $PORT_ARG $OUT_ARG $ARGS > /tmp/comfyui.log 2>&1 &
 COMFY_PID=$!
-log "ComfyUI PID = $COMFY_PID"
 
-# Clean up gracefully on container stop
-cleanup() {
-  log "Shutting down (SIGTERM)."
-  kill -TERM "$COMFY_PID" 2>/dev/null || true
-  wait "$COMFY_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-# ---------- wait for readiness ----------
-log "Waiting for ComfyUI to listen on :$COMFY_PORT ..."
-RETRIES=120
-until curl -sSf "http://127.0.0.1:${COMFY_PORT}/" >/dev/null 2>&1; do
-  ((RETRIES--)) || { 
-    log "ComfyUI did not become ready. Dumping last 200 log lines:"
-    tail -n 200 /tmp/comfyui.log || true
-    exit 1
-  }
-  sleep 1
+# ---------------------------
+# Wait for ComfyUI API
+# ---------------------------
+echo "[start] Waiting for ComfyUI API..."
+for i in {1..60}; do
+  if curl -s "http://127.0.0.1:$COMFY_PORT" >/dev/null 2>&1; then
+    echo "[start] ComfyUI is up on port $COMFY_PORT"
+    break
+  fi
+  sleep 2
 done
-log "ComfyUI is up on http://127.0.0.1:${COMFY_PORT}"
 
-# Optional: background-tail the Comfy log for easy debugging in RunPod logs
-( tail -n +1 -F /tmp/comfyui.log 2>/dev/null | sed -u 's/^/[comfy] /' ) &
+# ---------------------------
+# Launch RunPod handler
+# ---------------------------
+echo "[start] Launching rp_handler..."
+python rp_handler.py
 
-# ---------- start RunPod handler in foreground ----------
-if [[ -f "$RUNPOD_HANDLER_PATH" ]]; then
-  log "Starting RunPod serverless handler: $RUNPOD_HANDLER_PATH"
-  exec python3 -m runpod --handler-path "$RUNPOD_HANDLER_PATH"
-else
-  log "ERROR: RUNPOD_HANDLER_PATH not found at $RUNPOD_HANDLER_PATH"
-  exit 2
-fi
+# ---------------------------
+# Cleanup
+# ---------------------------
+trap 'kill -TERM $COMFY_PID 2>/dev/null || true' EXIT
+wait $COMFY_PID
