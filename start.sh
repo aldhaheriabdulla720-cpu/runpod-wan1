@@ -20,6 +20,38 @@ if [ ! -f /workspace/comfywan/extra_model_paths.yaml ] && [ -f /extra_model_path
   cp /extra_model_paths.yaml /workspace/comfywan/extra_model_paths.yaml || true
 fi
 
+# -------------------------
+# WAN 2.2 auto-download step
+# -------------------------
+echo "[boot] Ensuring WAN model dirs exist"
+mkdir -p /runpod-volume/{wan,vae,clip,lora}
+
+if [ "${WAN_BOOT_FETCH:-0}" = "1" ]; then
+  echo "[boot] Checking WAN models..."
+  [ -f /runpod-volume/wan/wan2.2.pth ] || aria2c -x16 -s16 -k1M -d /runpod-volume/wan \
+    -o wan2.2.pth "${WAN22_MODEL_URL:-}"
+  [ -f /runpod-volume/vae/wan_vae_b.pth ] || aria2c -x16 -s16 -k1M -d /runpod-volume/vae \
+    -o wan_vae_b.pth "${VAE_URL:-}"
+  [ -f /runpod-volume/clip/openclip_vith14.safetensors ] || aria2c -x16 -s16 -k1M -d /runpod-volume/clip \
+    -o openclip_vith14.safetensors "${CLIP_URL:-}"
+  if [ -n "${LORA1_URL:-}" ]; then
+    [ -f /runpod-volume/lora/cinematic_vibes.safetensors ] || aria2c -x16 -s16 -k1M -d /runpod-volume/lora \
+      -o cinematic_vibes.safetensors "$LORA1_URL"
+  fi
+fi
+
+echo "[boot] WAN models present:"
+ls -lh /runpod-volume/* || true
+
+# Write ComfyUI extra_model_paths.yaml pointing to /runpod-volume
+mkdir -p /root/.config/ComfyUI
+cat >/root/.config/ComfyUI/extra_model_paths.yaml <<'YAML'
+checkpoints: [/runpod-volume/wan]
+vae:         [/runpod-volume/vae]
+clip:        [/runpod-volume/clip]
+loras:       [/runpod-volume/lora]
+YAML
+
 # Force ComfyUI-Manager offline to avoid git during serverless boots
 export COMFYUI_MANAGER_CONFIG=/workspace/comfywan/user/default/ComfyUI-Manager/config.ini
 mkdir -p "$(dirname "$COMFYUI_MANAGER_CONFIG")"
