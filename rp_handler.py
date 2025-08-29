@@ -1,9 +1,8 @@
 # rp_handler.py — RunPod serverless handler for ComfyUI (video-ready)
-# - Expects ComfyUI running headless on 127.0.0.1:3000 (start.sh does this)
-# - Accepts job["input"]["workflow"] as a JSON OBJECT (not a string!)
-# - Streams execution via websocket; fetches artifacts from /view
-# - Returns base64 or uploads to S3/R2 via rp_upload (if bucket envs provided)
-# - Auto-deletes produced files unless KEEP_OUTPUTS=1
+# Additions:
+# - Echo path: {"input":{"ping":"pong"}}  → immediate 200
+# - Dry-run path: {"input":{"dry_run": true}} → immediate 200
+# - Original Comfy workflow execution preserved
 
 import os
 import json
@@ -73,7 +72,7 @@ def callback_api(payload: Dict[str, Any]) -> None:
 
 def check_server(url: str, retries: int, delay_ms: int) -> bool:
     log(f"checking API at {url} ...")
-    for i in range(retries):
+    for _ in range(retries):
         try:
             r = requests.get(url, timeout=5)
             if r.status_code == 200:
@@ -155,9 +154,7 @@ def validate_and_prepare(job_input: Any) -> Tuple[Dict[str, Any], str]:
 # ------------------------- Comfy interactions -------------------------
 
 def upload_init_images(images: List[Dict[str, str]]) -> None:
-    """
-    (Optional) Upload init images to ComfyUI via /upload (if your workflow references them).
-    """
+    """Upload init images to ComfyUI via /upload (if your workflow references them)."""
     for img in images:
         name = img["name"]
         b = try_decode_b64uri(img["image"])
@@ -168,9 +165,7 @@ def upload_init_images(images: List[Dict[str, str]]) -> None:
         log(f"uploaded init image: {name}")
 
 def queue_prompt(workflow: Dict[str, Any], client_id: str) -> str:
-    """
-    POST the workflow to /prompt and return the prompt_id
-    """
+    """POST the workflow to /prompt and return the prompt_id."""
     payload = {"prompt": workflow, "client_id": client_id}
     r = requests.post(PROMPT_URL, json=payload, timeout=120)
     if r.status_code != 200:
@@ -182,10 +177,7 @@ def queue_prompt(workflow: Dict[str, Any], client_id: str) -> str:
     return prompt_id
 
 def ws_listen(client_id: str, prompt_id: str) -> List[Dict[str, Any]]:
-    """
-    Connect to websocket and collect 'executed' messages for this prompt_id.
-    Returns a list of output descriptors reported by Comfy (node outputs).
-    """
+    """Connect to websocket and collect 'executed' messages for this prompt_id."""
     outputs = []
     attempts = 0
     start_time = time.time()
@@ -212,14 +204,11 @@ def ws_listen(client_id: str, prompt_id: str) -> List[Dict[str, Any]]:
                 except Exception:
                     continue
 
-                # We care about messages with 'type': 'executed'
                 if data.get("type") == "executed":
-                    # data['data'] contains node execution info; the key 'output' usually holds files
                     outputs.append(data)
                 elif data.get("type") == "execution_error":
                     raise RuntimeError(f"Comfy execution_error: {data}")
 
-                # 'status' message might signal end
                 if data.get("type") == "status":
                     status = data.get("data", {}).get("status")
                     if status in ("finished", "success"):
@@ -229,25 +218,20 @@ def ws_listen(client_id: str, prompt_id: str) -> List[Dict[str, Any]]:
             attempts += 1
             log(f"ws reconnect in {WEBSOCKET_RECONNECT_DELAY_S}s ({attempts}/{WEBSOCKET_RECONNECT_ATTEMPTS}) — {e}")
             time.sleep(WEBSOCKET_RECONNECT_DELAY_S)
-        except Exception as e:
+        except Exception:
             raise
     raise RuntimeError("Websocket reconnect attempts exhausted.")
 
 def collect_artifacts(outputs_msgs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    Parse 'executed' messages and build a list of artifacts with:
-    {"type": "image"|"video", "subfolder": "...", "filename": "...", "format": "png|mp4|..."}
-    """
+    """Parse 'executed' messages and build a list of artifacts descriptors."""
     artifacts: List[Dict[str, str]] = []
     for msg in outputs_msgs:
         d = msg.get("data", {})
         out = d.get("output", {}) or {}
-        # Comfy reports images/videos under different keys by node
         for key in ("images", "video", "gifs", "output"):
             items = out.get(key)
             if not items:
                 continue
-            # images/videos may be a list of dicts with subfolder/filename/format
             if isinstance(items, list):
                 for it in items:
                     fn = it.get("filename")
@@ -271,18 +255,30 @@ def read_file_b64(local_path: str) -> str:
 
 def handler(job):
     """
-    RunPod entrypoint. Expects:
-    {
-      "input": {
-        "workflow": { ... ComfyUI workflow object ... },
-        // optional "images": [{ "name": "...", "image": "<base64 or datauri>" }]
-      }
-    }
+    RunPod entrypoint. Supports:
+      1) Echo:   {"input":{"ping":"pong"}}
+      2) Dry-run {"input":{"dry_run": true}}
+      3) Comfy:  {"input":{"workflow": {...}, "images":[...]?}}
     """
     job_id = job.get("id") or str(uuid.uuid4())
     try:
-        # Validate input
-        validated, err = validate_and_prepare(job.get("input"))
+        # --------- Fast paths: echo / dry_run ---------
+        raw_input = job.get("input") or {}
+        if isinstance(raw_input, str):
+            try:
+                raw_input = json.loads(raw_input)
+            except Exception:
+                pass
+
+        if isinstance(raw_input, dict):
+            if "ping" in raw_input:
+                # Plain echo for health/latency checks
+                return {"status": "ok", "echo": raw_input.get("ping")}
+            if raw_input.get("dry_run"):
+                return {"status": "ok", "message": "dry_run"}
+
+        # --------- Normal Comfy path ---------
+        validated, err = validate_and_prepare(raw_input)
         if err:
             return {"error": err}
 
@@ -323,8 +319,6 @@ def handler(job):
             just_produced_files.append(local_path)
 
             if RETURN_MODE == "url":
-                # upload to S3/R2 bucket via RunPod helper
-                # NOTE: rp_upload returns a dict with 'file' and 'url'
                 uploaded = rp_upload.upload_file(local_path)
                 results.append({
                     "type": a["type"],
@@ -334,7 +328,6 @@ def handler(job):
                     "url": uploaded.get("url")
                 })
             else:
-                # inline base64
                 b64 = read_file_b64(local_path)
                 results.append({
                     "type": a["type"],
@@ -349,7 +342,6 @@ def handler(job):
             "artifacts": results
         }
 
-        # cleanup after successful return build
         cleanup_outputs(just_produced_files)
         callback_api({"action": "complete", "job_id": job_id, "result": {"status": "success", "count": len(results)}})
         return response
