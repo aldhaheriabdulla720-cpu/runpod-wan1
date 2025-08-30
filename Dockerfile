@@ -51,12 +51,9 @@ RUN if [ -f "$COMFY_DIR/custom_nodes/ComfyUI-KJNodes/requirements.txt" ]; then \
 RUN pip install --no-cache-dir runpod==1.7.9
 
 # ---- App layout ----
-# Put workflows at /workspace/workflows (handler expects this)
 WORKDIR /workspace
 COPY workflows/ /workspace/workflows/
-# Your model path map (we’ll link it into the Comfy root at runtime)
 COPY extra_model_paths.yaml /workspace/extra_model_paths.yaml
-# Startup + handler
 COPY start.sh /workspace/start.sh
 COPY rp_handler.py /workspace/rp_handler.py
 RUN chmod +x /workspace/start.sh
