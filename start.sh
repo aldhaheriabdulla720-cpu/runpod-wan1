@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-# -------- ENV (can be overridden in Endpoint Envs) --------
+# -------- ENV (overridable via Endpoint Envs) --------
 export COMFY_HOST="${COMFY_HOST:-0.0.0.0}"
 export COMFY_PORT="${COMFY_PORT:-8188}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output}"
@@ -23,10 +23,10 @@ mkdir -p "$OUTPUT_DIR" "$TMP_DIR" "$DIFF_DIR" "$VAE_DIR"
 : > /tmp/comfyui.log
 : > /tmp/bootstrap.log
 
-# -------- GPU sanity (prints once at boot) --------
+# -------- GPU sanity (so you can see mount issues immediately) --------
 echo "[gpu] nvidia-smi:"
 (nvidia-smi || echo "no GPU visible")
-python - <<'PY' || true
+/usr/bin/python - <<'PY' || true
 import torch
 print("[gpu] torch.cuda.is_available():", torch.cuda.is_available())
 print("[gpu] torch.cuda.device_count():", torch.cuda.device_count())
@@ -35,7 +35,7 @@ if torch.cuda.is_available():
 PY
 
 # -------- Optional: HF whoami (non-fatal) --------
-python - <<'PY' >/tmp/hf_whoami.log 2>&1 || true
+/usr/bin/python - <<'PY' >/tmp/hf_whoami.log 2>&1 || true
 import os
 from huggingface_hub import HfApi
 tok = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or ""
@@ -59,7 +59,15 @@ echo "[start] Launching ComfyUI on ${COMFY_HOST}:${COMFY_PORT} ..."
   --temp-directory "${TMP_DIR}" \
   2>&1 | tee -a /tmp/comfyui.log &
 COMFY_PID=$!
-trap 'kill -TERM "$COMFY_PID" 2>/dev/null || true; wait "$COMFY_PID" 2>/dev/null || true' INT TERM
+
+# Clean shutdown
+cleanup() {
+  echo "[stop] Stopping..."
+  kill -TERM "$COMFY_PID" 2>/dev/null || true
+  wait "$COMFY_PID" 2>/dev/null || true
+  echo "[stop] Done."
+}
+trap cleanup TERM INT
 
 # -------- Wait for port (max 300s) --------
 WAIT_URL="http://127.0.0.1:${COMFY_PORT}/system_stats"
@@ -77,7 +85,7 @@ until curl -fsS "$WAIT_URL" >/dev/null 2>&1; do
 done
 echo "[ok] ComfyUI is READY."
 
-# -------- Background WAN downloads (non-fatal) --------
+# -------- Background WAN downloads (non-fatal if no token) --------
 (
 /usr/bin/python - <<'PY'
 from huggingface_hub import snapshot_download, hf_hub_download
