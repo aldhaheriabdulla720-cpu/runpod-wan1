@@ -14,12 +14,12 @@ export COMFY_PORT="${COMFY_PORT:-8188}"
 export COMFY_ARGS="${COMFY_ARGS:---output-directory /workspace/output}"
 export RETURN_MODE="${RETURN_MODE:-base64}"
 
-# WAN repos
+# WAN repos (A14B)
 export WAN_T2V_REPO="${WAN_T2V_REPO:-Wan-AI/Wan2.2-T2V-A14B}"
 export WAN_I2V_REPO="${WAN_I2V_REPO:-Wan-AI/Wan2.2-I2V-A14B}"
 export WAN_VAE_FILE="${WAN_VAE_FILE:-Wan2.1_VAE.pth}"
 
-# Toggle both (you have 70 GB)
+# Enable both (you have 70 GB)
 export WAN_ENABLE_T2V="${WAN_ENABLE_T2V:-true}"
 export WAN_ENABLE_I2V="${WAN_ENABLE_I2V:-true}"
 
@@ -35,10 +35,10 @@ mkdir -p "$COMFY_DIR/models/checkpoints" "$COMFY_DIR/models/vae" \
          "$COMFY_DIR/models/loras" "$COMFY_DIR/models/clip_vision"
 mkdir -p /workspace/output
 
-# Link extra_model_paths.yaml into the Comfy root so Comfy actually reads it
+# Link extra_model_paths.yaml into the Comfy root so Comfy reads it
 if [[ -f /workspace/extra_model_paths.yaml ]]; then
   ln -sf /workspace/extra_model_paths.yaml "$COMFY_DIR/extra_model_paths.yaml"
-  log "[paths] extra_model_paths.yaml linked -> $COMFY_DIR/extra_model_paths.yaml"
+  log "[paths] extra_model_paths.yaml -> $COMFY_DIR/extra_model_paths.yaml"
 fi
 
 log "[env] COMFY_DIR=$COMFY_DIR  MODEL_DIR=$MODEL_DIR  HF_HOME=$HF_HOME"
@@ -106,7 +106,7 @@ else: print("[hf] T2V disabled")
 if enable_i2v: snap(i2v_repo, os.path.join(diff_dir, "wan2.2-i2v"))
 else: print("[hf] I2V disabled")
 
-# VAE exists inside WAN repos; prefer one that is enabled
+# VAE exists inside WAN repos; prefer an enabled repo
 vae_repo = i2v_repo if enable_i2v else t2v_repo
 try:
     print(f"[hf] downloading VAE {vae_file} from {vae_repo}")
@@ -123,16 +123,14 @@ except Exception as e:
 print("[hf] bootstrap complete")
 PY
 
-# -------- Link models into Comfy tree (what was missing before) --------
+# -------- Link models into Comfy tree (was missing before) --------
 # VAE
 if [[ -f "$VAE_DIR/$WAN_VAE_FILE" ]]; then
   ln -sf "$VAE_DIR/$WAN_VAE_FILE" "$COMFY_DIR/models/vae/$WAN_VAE_FILE"
-  log "[paths] VAE linked -> $COMFY_DIR/models/vae/$WAN_VAE_FILE"
+  log "[paths] VAE -> $COMFY_DIR/models/vae/$WAN_VAE_FILE"
 fi
 
-# Create or refresh friendly checkpoint aliases in the Comfy checkpoints folder.
-# We point them at the first large .safetensors shard we find (good enough for Comfy to enumerate).
-# Your workflows reference these names directly.
+# Create/refresh friendly checkpoint aliases in Comfy checkpoints folder
 (
   set -e
   T2V_SRC=$(find "$DIFFUSION_DIR/wan2.2-t2v" -type f -name '*.safetensors' -size +500M | head -n1 || true)
