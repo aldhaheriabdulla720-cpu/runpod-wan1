@@ -1,176 +1,156 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[boot] start.sh invoked (ts=$(date -Is))"
+log() { echo "[$(date +'%F %T')] $*"; }
 
-# ---------------------------
-# Defaults & paths
-# ---------------------------
-COMFY_HOST="${COMFY_HOST:-0.0.0.0}"
-COMFY_PORT="${COMFY_PORT:-8188}"
-COMFY_ARGS="${COMFY_ARGS:---output-directory /workspace/output}"
-PYTHON="${PYTHON:-/usr/bin/python}"
-COMFY_DIR="/workspace/comfywan"
+# -------- Env & paths --------
+export COMFY_DIR="${COMFY_DIR:-/workspace/comfywan}"
+export MODEL_DIR="${MODEL_DIR:-/workspace/models}"
+export DIFFUSION_DIR="${DIFFUSION_DIR:-$MODEL_DIR/diffusion_models}"
+export VAE_DIR="${VAE_DIR:-$MODEL_DIR/vae}"
+export WORKFLOWS_DIR="${WORKFLOWS_DIR:-/workspace/workflows}"
+export COMFY_HOST="${COMFY_HOST:-0.0.0.0}"
+export COMFY_PORT="${COMFY_PORT:-8188}"
+export COMFY_ARGS="${COMFY_ARGS:---output-directory /workspace/output}"
+export RETURN_MODE="${RETURN_MODE:-base64}"
 
-MODEL_DIR="${MODEL_DIR:-/workspace/models}"
-DIFFUSION_DIR="${DIFFUSION_DIR:-/workspace/models/diffusion_models}"
-VAE_DIR="${VAE_DIR:-/workspace/models/vae}"
-TEXT_ENCODERS_DIR="${TEXT_ENCODERS_DIR:-/workspace/models/text_encoders}"
-CLIP_VISION_DIR="${CLIP_VISION_DIR:-/workspace/models/clip_vision}"
-LORAS_DIR="${LORAS_DIR:-/workspace/models/loras}"
+# WAN repos
+export WAN_T2V_REPO="${WAN_T2V_REPO:-Wan-AI/Wan2.2-T2V-A14B}"
+export WAN_I2V_REPO="${WAN_I2V_REPO:-Wan-AI/Wan2.2-I2V-A14B}"
+export WAN_VAE_FILE="${WAN_VAE_FILE:-Wan2.1_VAE.pth}"
 
-WAN_T2V_REPO="${WAN_T2V_REPO:-Wan-AI/Wan2.2-T2V-A14B}"
-WAN_I2V_REPO="${WAN_I2V_REPO:-Wan-AI/Wan2.2-I2V-A14B}"
-WAN_VAE_FILE="${WAN_VAE_FILE:-Wan2.1_VAE.pth}"
-HF_TOKEN="${HF_TOKEN:-}"
+# Toggle both (you have 70 GB)
+export WAN_ENABLE_T2V="${WAN_ENABLE_T2V:-true}"
+export WAN_ENABLE_I2V="${WAN_ENABLE_I2V:-true}"
 
-mkdir -p "$MODEL_DIR" "$DIFFUSION_DIR" "$VAE_DIR" "$TEXT_ENCODERS_DIR" "$CLIP_VISION_DIR" "$LORAS_DIR" /workspace/output
-touch /tmp/bootstrap.log /tmp/comfyui.log
+# Put HF cache on the network volume to avoid filling root FS
+export HF_HOME="${HF_HOME:-$MODEL_DIR/hf_cache}"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME"
+export TRANSFORMERS_CACHE="$HF_HOME"
+mkdir -p "$HF_HOME"
 
-echo "[env] RUNPOD_POD_TYPE=${RUNPOD_POD_TYPE:-unset}"
-echo "[env] COMFY_HOST=$COMFY_HOST COMFY_PORT=$COMFY_PORT"
-echo "[env] MODEL_DIR=$MODEL_DIR"
+# Ensure directory trees exist
+mkdir -p "$MODEL_DIR" "$DIFFUSION_DIR" "$VAE_DIR"
+mkdir -p "$COMFY_DIR/models/checkpoints" "$COMFY_DIR/models/vae" \
+         "$COMFY_DIR/models/loras" "$COMFY_DIR/models/clip_vision"
+mkdir -p /workspace/output
 
-# ---------------------------
-# GPU sanity (skip on CPU)
-# ---------------------------
-if [ "${RUNPOD_POD_TYPE:-CPU}" = "GPU" ]; then
-  echo "[gpu] Checking CUDA…"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi || true
-  fi
-  $PYTHON - <<'PY' || echo "[gpu] Torch CUDA not available; continuing anyway."
-import torch, sys
-print("[gpu] torch.is_available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("[gpu] device:", torch.cuda.get_device_name(0))
-PY
-else
-  echo "[gpu] CPU endpoint detected; skipping CUDA check."
+# Link extra_model_paths.yaml into the Comfy root so Comfy actually reads it
+if [[ -f /workspace/extra_model_paths.yaml ]]; then
+  ln -sf /workspace/extra_model_paths.yaml "$COMFY_DIR/extra_model_paths.yaml"
+  log "[paths] extra_model_paths.yaml linked -> $COMFY_DIR/extra_model_paths.yaml"
 fi
 
-# ---------------------------
-# Launch ComfyUI (background)
-# ---------------------------
-cd "$COMFY_DIR"
-HOST_ARG="--listen $COMFY_HOST"
-PORT_ARG="--port $COMFY_PORT"
+log "[env] COMFY_DIR=$COMFY_DIR  MODEL_DIR=$MODEL_DIR  HF_HOME=$HF_HOME"
 
-echo "[start] Starting ComfyUI…"
-set +e
-$PYTHON main.py $HOST_ARG $PORT_ARG $COMFY_ARGS > /tmp/comfyui.log 2>&1 &
+# -------- Launch ComfyUI (background) --------
+log "[start] Starting ComfyUI…"
+pushd "$COMFY_DIR" >/dev/null
+python3 -u main.py --listen "$COMFY_HOST" --port "$COMFY_PORT" $COMFY_ARGS \
+  > /tmp/comfyui.log 2>&1 &
 COMFY_PID=$!
-set -e
-echo "[start] ComfyUI PID=$COMFY_PID"
+popd >/dev/null
 
-# ---------------------------
-# Wait for ComfyUI API
-# ---------------------------
-echo "[wait] Waiting for ComfyUI to be ready at http://127.0.0.1:${COMFY_PORT}/system_stats"
-READY=0
-for i in {1..180}; do
-  if curl -fsS "http://127.0.0.1:${COMFY_PORT}/system_stats" >/dev/null 2>&1; then
-    READY=1
+# Wait for API to be ready
+log "[wait] Waiting for ComfyUI API…"
+for i in {1..120}; do
+  if curl -fsS "http://127.0.0.1:${COMFY_PORT}/system_stats" >/dev/null; then
+    log "[wait] ComfyUI is ready."
     break
   fi
-  sleep 1
+  sleep 2
+  if ! kill -0 $COMFY_PID 2>/dev/null; then
+    log "[error] ComfyUI process died. Tail /tmp/comfyui.log"
+    exit 1
+  fi
+  if [[ $i -eq 120 ]]; then
+    log "[error] ComfyUI did not become ready."
+    exit 1
+  fi
 done
-if [ "$READY" -ne 1 ]; then
-  echo "[wait] ComfyUI did not become ready in time. Tail of log:"
-  tail -n 200 /tmp/comfyui.log || true
-  exit 1
-fi
-echo "[wait] ComfyUI is ready."
 
-# ---------------------------
-# Background model bootstrap (WAN 2.2 + VAE)
-# Using huggingface_hub to avoid fragile shell header quoting.
-# ---------------------------
-(
-  set -e
-  echo "[dl] Model bootstrap started…" | tee -a /tmp/bootstrap.log
-  $PYTHON - <<PY 2>&1 | tee -a /tmp/bootstrap.log
-import os, shutil
+# -------- Bootstrap: download WAN models & VAE --------
+log "[hf] Bootstrapping WAN models… (logs -> /tmp/bootstrap.log)"
+python3 - <<'PY' 2>&1 | tee -a /tmp/bootstrap.log
+import os, shutil, sys
 from huggingface_hub import snapshot_download, hf_hub_download
 
-tok = os.getenv("HF_TOKEN", None)
-diff_dir = os.getenv("DIFFUSION_DIR", "/workspace/models/diffusion_models")
-vae_dir  = os.getenv("VAE_DIR", "/workspace/models/vae")
-t2v_repo = os.getenv("WAN_T2V_REPO", "Wan-AI/Wan2.2-T2V-A14B")
-i2v_repo = os.getenv("WAN_I2V_REPO", "Wan-AI/Wan2.2-I2V-A14B")
-vae_file = os.getenv("WAN_VAE_FILE", "Wan2.1_VAE.pth")
+tok = os.getenv("HF_TOKEN")
+diff_dir  = os.getenv("DIFFUSION_DIR", "/workspace/models/diffusion_models")
+vae_dir   = os.getenv("VAE_DIR", "/workspace/models/vae")
+t2v_repo  = os.getenv("WAN_T2V_REPO", "Wan-AI/Wan2.2-T2V-A14B")
+i2v_repo  = os.getenv("WAN_I2V_REPO", "Wan-AI/Wan2.2-I2V-A14B")
+vae_file  = os.getenv("WAN_VAE_FILE", "Wan2.1_VAE.pth")
+enable_t2v = os.getenv("WAN_ENABLE_T2V", "true").lower() == "true"
+enable_i2v = os.getenv("WAN_ENABLE_I2V", "true").lower() == "true"
+cache_dir  = os.getenv("HF_HOME", "/workspace/models/hf_cache")
 
 os.makedirs(diff_dir, exist_ok=True)
 os.makedirs(vae_dir, exist_ok=True)
 
-def safe_snapshot(repo_id, local_dir):
+def snap(repo_id, local_dir):
+    print(f"[hf] snapshot_download {repo_id} -> {local_dir}")
     try:
-        print(f"[hf] snapshot_download: {repo_id} -> {local_dir}")
-        snapshot_download(repo_id=repo_id, local_dir=local_dir,
-                          local_dir_use_symlinks=False, token=tok, resume_download=True)
+        snapshot_download(repo_id=repo_id,
+                          local_dir=local_dir,
+                          local_dir_use_symlinks=False,
+                          token=tok, resume_download=True,
+                          cache_dir=cache_dir)
+        print(f"[hf] done {repo_id}")
     except Exception as e:
-        print(f"[hf] WARN: snapshot failed for {repo_id}: {e}")
+        print(f"[hf] WARN {repo_id}: {e}", file=sys.stderr)
 
-# WAN shards (directories include high_noise_model/low_noise_model)
-safe_snapshot(t2v_repo, os.path.join(diff_dir, "wan2.2-t2v"))
-safe_snapshot(i2v_repo, os.path.join(diff_dir, "wan2.2-i2v"))
+if enable_t2v: snap(t2v_repo, os.path.join(diff_dir, "wan2.2-t2v"))
+else: print("[hf] T2V disabled")
 
-# VAE from dedicated repo (don't fetch from T2V/I2V repo)
+if enable_i2v: snap(i2v_repo, os.path.join(diff_dir, "wan2.2-i2v"))
+else: print("[hf] I2V disabled")
+
+# VAE exists inside WAN repos; prefer one that is enabled
+vae_repo = i2v_repo if enable_i2v else t2v_repo
 try:
-    vae_path = hf_hub_download(repo_id="Wan-AI/Wan2.2-VAE", filename=vae_file, token=tok)
+    print(f"[hf] downloading VAE {vae_file} from {vae_repo}")
+    vae_path = hf_hub_download(repo_id=vae_repo, filename=vae_file,
+                               token=tok, cache_dir=cache_dir)
     dst = os.path.join(vae_dir, os.path.basename(vae_path))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
     if not os.path.exists(dst):
         shutil.copy2(vae_path, dst)
     print(f"[hf] VAE ready at {dst}")
 except Exception as e:
-    print(f"[hf] WARN: VAE download skipped/failed: {e}")
+    print(f"[hf] WARN VAE download: {e}", file=sys.stderr)
 
-print("[hf] Bootstrap done.")
+print("[hf] bootstrap complete")
 PY
-) &
 
-# ---------------------------
-# Non-blocking aliasing (avoid cold-start delays)
-# ---------------------------
-ckpt_dir="/workspace/comfywan/models/checkpoints"; mkdir -p "${ckpt_dir}"
+# -------- Link models into Comfy tree (what was missing before) --------
+# VAE
+if [[ -f "$VAE_DIR/$WAN_VAE_FILE" ]]; then
+  ln -sf "$VAE_DIR/$WAN_VAE_FILE" "$COMFY_DIR/models/vae/$WAN_VAE_FILE"
+  log "[paths] VAE linked -> $COMFY_DIR/models/vae/$WAN_VAE_FILE"
+fi
 
-try_link() {  # $1=model tag; $2=base path
-  local model="$1"; local base="$2"; local f=""
-  for pat in \
-    "low_noise_model/*.safetensors.index.json" \
-    "high_noise_model/*.safetensors.index.json" \
-    "low_noise_model/*.safetensors" \
-    "high_noise_model/*.safetensors"
-  do
-    f=$(ls -1 ${base}/${pat} 2>/dev/null | head -n 1 || true)
-    [ -n "$f" ] && break
-  done
-  if [ -n "$f" ]; then
-    ln -sf "$f" "${ckpt_dir}/wan2.2-${model}.safetensors"
-    echo "[alias] ${model^^} -> ${ckpt_dir}/wan2.2-${model}.safetensors"
-  else
-    echo "[alias] ${model^^} not present yet; skipping."
-  fi
-}
-
-T2V_BASE="${DIFFUSION_DIR}/wan2.2-t2v"
-I2V_BASE="${DIFFUSION_DIR}/wan2.2-i2v"
-try_link "t2v" "$T2V_BASE"
-try_link "i2v" "$I2V_BASE"
-
-# Watcher to re-link when shards finish
+# Create or refresh friendly checkpoint aliases in the Comfy checkpoints folder.
+# We point them at the first large .safetensors shard we find (good enough for Comfy to enumerate).
+# Your workflows reference these names directly.
 (
-  for i in {1..180}; do
-    try_link "t2v" "$T2V_BASE"
-    try_link "i2v" "$I2V_BASE"
-    sleep 2
-  done
-) >/tmp/alias-watch.log 2>&1 &
+  set -e
+  T2V_SRC=$(find "$DIFFUSION_DIR/wan2.2-t2v" -type f -name '*.safetensors' -size +500M | head -n1 || true)
+  I2V_SRC=$(find "$DIFFUSION_DIR/wan2.2-i2v" -type f -name '*.safetensors' -size +500M | head -n1 || true)
+  if [[ -n "$T2V_SRC" ]]; then
+    ln -sf "$T2V_SRC" "$COMFY_DIR/models/checkpoints/wan2.2-t2v.safetensors"
+    log "[paths] T2V alias -> $COMFY_DIR/models/checkpoints/wan2.2-t2v.safetensors"
+  else
+    log "[paths] T2V shard not found yet; alias skipped"
+  fi
+  if [[ -n "$I2V_SRC" ]]; then
+    ln -sf "$I2V_SRC" "$COMFY_DIR/models/checkpoints/wan2.2-i2v.safetensors"
+    log "[paths] I2V alias -> $COMFY_DIR/models/checkpoints/wan2.2-i2v.safetensors"
+  else
+    log "[paths] I2V shard not found yet; alias skipped"
+  fi
+) 2>&1 | tee -a /tmp/alias-watch.log
 
-# ---------------------------
-# Start handler in foreground (so health checks pass)
-# ---------------------------
-echo "[handler] Starting rp_handler.py…"
-trap 'echo "[shutdown] SIGTERM"; kill -TERM ${COMFY_PID} 2>/dev/null || true; wait ${COMFY_PID} 2>/dev/null || true' TERM INT
-exec $PYTHON -u /workspace/rp_handler.py
-
+# -------- RunPod handler (foreground) --------
+log "[handler] starting worker…"
+exec python3 -u /workspace/rp_handler.py
