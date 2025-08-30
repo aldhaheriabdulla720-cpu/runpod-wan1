@@ -1,82 +1,90 @@
 #!/usr/bin/env python3
-import os, json, time, traceback
-import requests
-import runpod
+import json, os, time, requests
+from typing import Any, Dict
+from runpod.serverless import start
 
-COMFY_PORT = os.getenv("COMFY_PORT", "8188")
-COMFY_URL  = f"http://127.0.0.1:{COMFY_PORT}"
-WORKFLOWS_DIR = "/workspace/workflows"
-RETURN_MODE = os.getenv("RETURN_MODE", "base64")
+COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
+COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
+COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-def wait_for_comfy(timeout=180):
+WORKFLOWS_DIR = os.getenv("WORKFLOWS_DIR", "/workspace/workflows")
+RETURN_MODE   = os.getenv("RETURN_MODE", "base64")
+
+def _wait_for_comfy(timeout=120):
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
-            r = requests.get(f"{COMFY_URL}/system_stats", timeout=2)
+            r = requests.get(f"{COMFY_URL}/system_stats", timeout=5)
             if r.ok:
                 return True
         except Exception:
-            time.sleep(1)
+            pass
+        time.sleep(1)
     return False
 
-def _load_workflow(spec):
+def _load_workflow_obj(spec: Any) -> Dict[str, Any]:
     if isinstance(spec, dict):
         return spec
     if isinstance(spec, str):
-        path = os.path.join(WORKFLOWS_DIR, spec)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"workflow file not found: {path}")
+        # treat as filename under WORKFLOWS_DIR
+        path = spec if spec.startswith("/") else os.path.join(WORKFLOWS_DIR, spec)
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    raise ValueError("Invalid 'workflow' type; must be dict or filename string.")
+    raise ValueError("workflow must be a dict or filename")
 
 def _post_prompt(workflow_obj):
     r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow_obj}, timeout=30)
-    r.raise_for_status()
+    if not r.ok:
+        # Bubble up server error so we can see exactly which node/field failed
+        return {"http_status": r.status_code, "error_text": r.text}
     j = r.json()
+    # Comfy returns {'prompt_id': '...'} (sometimes node_id); accept either
     return j.get("prompt_id") or j.get("node_id")
 
-def _poll_history(prompt_id, timeout=600):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
-        if r.ok:
-            j = r.json()
-            if isinstance(j, dict) and prompt_id in j:
-                return j[prompt_id]
-            return j
-        time.sleep(1.0)
-    raise TimeoutError("Timed out waiting for Comfy result")
-
 def handler(event):
+    """RunPod /runsync handler"""
+    inp = event.get("input", {})
+    dry = bool(inp.get("dry_run", False))
+    wf  = inp.get("workflow")
+
+    # Health & readiness
+    comfy_ready = _wait_for_comfy(60)
+    if dry:
+        # Also verify the workflow file exists (if a string was given)
+        exists = True
+        if isinstance(wf, str):
+            p = wf if wf.startswith("/") else os.path.join(WORKFLOWS_DIR, wf)
+            exists = os.path.exists(p)
+        return {"status": "ok", "comfy_ready": comfy_ready, "workflow": wf, "workflow_exists": exists}
+
+    if not comfy_ready:
+        return {"status": "error", "msg": "ComfyUI not ready"}
+
+    # Load workflow JSON (file or dict)
     try:
-        inp = (event or {}).get("input", {}) or {}
-
-        if inp.get("dry_run"):
-            ready = wait_for_comfy()
-            wf = inp.get("workflow")
-            wf_exists = True
-            if isinstance(wf, str):
-                wf_exists = os.path.exists(os.path.join(WORKFLOWS_DIR, wf))
-            return {"status": "ok", "comfy_ready": bool(ready), "workflow": wf, "workflow_exists": bool(wf_exists)}
-
-        wf_spec = inp.get("workflow")
-        if wf_spec is None:
-            return {"error": "Missing 'workflow' parameter"}
-
-        if not wait_for_comfy():
-            return {"error": "ComfyUI not ready"}
-
-        workflow = _load_workflow(wf_spec)
-
-        # (Optional) edit workflow using inp["params"] here
-
-        prompt_id = _post_prompt(workflow)
-        result = _poll_history(prompt_id)
-
-        return {"status": "ok", "prompt_id": prompt_id, "result": result}
-
+        workflow = _load_workflow_obj(wf)
     except Exception as e:
-        return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+        return {"status": "error", "msg": f"failed to load workflow: {e}"}
 
-runpod.serverless.start({"handler": handler})
+    # Submit prompt
+    prompt_id = _post_prompt(workflow)
+    if isinstance(prompt_id, dict) and prompt_id.get("http_status"):
+        # Return Comfy's exact error body (400/500), super helpful for diagnosing
+        return {"status": "error", "from": "/prompt", **prompt_id}
+
+    # Poll history until done
+    for _ in range(600):  # ~10 min max
+        try:
+            r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
+            if r.ok:
+                hist = r.json()
+                if hist:
+                    # Return raw history; your client can pick the images/videos or base64
+                    return {"status": "ok", "return_mode": RETURN_MODE, "result": hist}
+        except Exception:
+            pass
+        time.sleep(1)
+
+    return {"status": "error", "msg": "timeout waiting for result"}
+
+start({"handler": handler})
