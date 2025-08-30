@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-# ---- Torch CUDA 12.1 stack ----
+# ---- Torch CUDA 12.1 ----
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 
@@ -37,10 +37,21 @@ RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace
 WORKDIR /workspace/comfywan
 RUN pip install --no-cache-dir -r requirements.txt || true
 
+# ---- Required custom nodes for your workflows ----
+# WanVaceToVideo is now documented as built-in in Comfy docs, but your graphs also use CreateVideo/SaveVideo and TorchSettings patches.
+RUN mkdir -p /workspace/comfywan/custom_nodes && cd /workspace/comfywan/custom_nodes && \
+    git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git && \
+    git clone --depth=1 https://github.com/kijai/ComfyUI-KJNodes.git
+
+# Optional: install custom node requirements if present
+RUN if [ -f /workspace/comfywan/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
+      pip install --no-cache-dir -r /workspace/comfywan/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
+    fi || true
+
 # ---- Back to /workspace to copy our app files ----
 WORKDIR /workspace
 
-# ENV contract (can be overridden in RunPod endpoint)
+# ENV contract (overridable via RunPod env)
 ENV RUNPOD_POD_TYPE=GPU \
     COMFY_HOST=0.0.0.0 \
     COMFY_PORT=8188 \
@@ -56,18 +67,13 @@ ENV RUNPOD_POD_TYPE=GPU \
     WAN_I2V_REPO=Wan-AI/Wan2.2-I2V-A14B \
     WAN_VAE_FILE=Wan2.1_VAE.pth
 
-# Copy your workflows folder (make sure it exists in your repo)
-# Example: wan2.2-t2v.json, wan2.2-i2v.json, etc.
+# Workflows + model paths
 COPY workflows/ /workspace/workflows/
-
-# Extra model paths for ComfyUI
 COPY extra_model_paths.yaml /workspace/extra_model_paths.yaml
 
 # Startup script + handler
 COPY start.sh /workspace/start.sh
 COPY rp_handler.py /workspace/rp_handler.py
-
 RUN chmod +x /workspace/start.sh
 
-# RunPod looks at the main process; keep handler foregrounded via start.sh
 ENTRYPOINT ["bash", "/workspace/start.sh"]
