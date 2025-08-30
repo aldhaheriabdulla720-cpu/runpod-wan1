@@ -1,5 +1,16 @@
-checkpoints: [/workspace/comfywan/models/checkpoints, /workspace/models/diffusion_models]
-vae:         [/workspace/comfywan/models/vae, /workspace/models/vae]
-clip:        [/workspace/models/text_encoders]
-clip_vision: [/workspace/models/clip_vision]
-loras:       [/workspace/models/loras]
+# This file is linked into /workspace/comfywan/extra_model_paths.yaml at startup.
+# Comfy scans these directories for the corresponding resource types.
+
+checkpoints:
+  - /workspace/comfywan/models/checkpoints
+  - /workspace/models/diffusion_models
+
+vae:
+  - /workspace/comfywan/models/vae
+  - /workspace/models/vae
+
+loras:
+  - /workspace/comfywan/models/loras
+
+clip_vision:
+  - /workspace/comfywan/models/clip_vision
