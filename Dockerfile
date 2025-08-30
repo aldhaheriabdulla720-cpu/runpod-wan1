@@ -34,6 +34,9 @@ RUN pip install --no-cache-dir \
 # ---- Clone ComfyUI (to /workspace/comfywan) ----
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/comfywan
 
+# ✅ New (safe) line: install ComfyUI requirements so nodes don't miss deps
+RUN pip install --no-cache-dir -r /workspace/comfywan/requirements.txt
+
 # (Optional) Example custom nodes (comment out if you don’t want them)
 # RUN git clone --depth=1 https://github.com/cubiq/ComfyUI_essentials.git /workspace/comfywan/custom_nodes/ComfyUI_essentials
 # RUN git clone --depth=1 https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git /workspace/comfywan/custom_nodes/ComfyUI-Custom-Scripts
@@ -59,3 +62,4 @@ WORKDIR /workspace/comfywan
 
 # ---- Start the stack ----
 ENTRYPOINT ["bash", "/workspace/start.sh"]
+
