@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# start.sh — ComfyUI headless + WAN bootstrap + RunPod worker (robust)
-# - Prints GPU sanity info
-# - Launches ComfyUI and WAITS for http://127.0.0.1:8188/system_stats
-# - Starts RunPod serverless worker correctly: runpod.serverless.worker rp_handler
-# - Background WAN downloads (non-fatal if token missing)
+# start.sh — ComfyUI headless + WAN bootstrap + RunPod worker (safetensors, final)
 
 set -euo pipefail
 
-# -------- ENV (overridable via Endpoint Envs) --------
+# -------- ENV --------
 export COMFY_HOST="${COMFY_HOST:-0.0.0.0}"
 export COMFY_PORT="${COMFY_PORT:-8188}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output}"
 export TMP_DIR="${TMP_DIR:-/workspace/tmp}"
-
 export HF_TOKEN="${HF_TOKEN:-}"
 export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$HF_TOKEN}"
 
@@ -23,18 +18,23 @@ mkdir -p "$OUTPUT_DIR" "$TMP_DIR" "$DIFF_DIR" "$VAE_DIR"
 : > /tmp/comfyui.log
 : > /tmp/bootstrap.log
 
-# -------- GPU sanity (so you can see mount issues immediately) --------
-echo "[gpu] nvidia-smi:"
-(nvidia-smi || echo "no GPU visible")
+# -------- GPU sanity --------
+echo "[gpu] nvidia-smi:"; (nvidia-smi || echo "no GPU visible")
 /usr/bin/python - <<'PY' || true
-import torch
-print("[gpu] torch.cuda.is_available():", torch.cuda.is_available())
-print("[gpu] torch.cuda.device_count():", torch.cuda.device_count())
+import torch, sys
+print("[gpu] torch.__version__:", torch.__version__)
+print("[gpu] torch.version.cuda:", torch.version.cuda)
+print("[gpu] cuda.is_available():", torch.cuda.is_available())
+print("[gpu] device_count:", torch.cuda.device_count())
 if torch.cuda.is_available():
     print("[gpu] device 0:", torch.cuda.get_device_name(0))
+    sys.exit(0)
+else:
+    print("[FATAL] CUDA not available — exiting so worker doesn’t go unhealthy.")
+    sys.exit(1)
 PY
 
-# -------- Optional: HF whoami (non-fatal) --------
+# -------- Optional: HF whoami --------
 /usr/bin/python - <<'PY' >/tmp/hf_whoami.log 2>&1 || true
 import os
 from huggingface_hub import HfApi
@@ -60,32 +60,22 @@ echo "[start] Launching ComfyUI on ${COMFY_HOST}:${COMFY_PORT} ..."
   2>&1 | tee -a /tmp/comfyui.log &
 COMFY_PID=$!
 
-# Clean shutdown
-cleanup() {
-  echo "[stop] Stopping..."
-  kill -TERM "$COMFY_PID" 2>/dev/null || true
-  wait "$COMFY_PID" 2>/dev/null || true
-  echo "[stop] Done."
-}
+cleanup() { kill -TERM "$COMFY_PID" 2>/dev/null || true; wait "$COMFY_PID" 2>/dev/null || true; }
 trap cleanup TERM INT
 
 # -------- Wait for port (max 300s) --------
-WAIT_URL="http://127.0.0.1:${COMFY_PORT}/system_stats"
-TIMEOUT=300
+WAIT_URL="http://127.0.0.1:${COMFY_PORT}/system_stats"; TIMEOUT=300
 echo "[wait] Waiting for ComfyUI at ${WAIT_URL} (timeout ${TIMEOUT}s)..."
 START_TS=$(date +%s)
 until curl -fsS "$WAIT_URL" >/dev/null 2>&1; do
   sleep 1
-  NOW=$(date +%s)
-  if (( NOW - START_TS > TIMEOUT )); then
-    echo "[error] ComfyUI didn't become ready within ${TIMEOUT}s. Last 200 lines:"
-    tail -n 200 /tmp/comfyui.log || true
-    exit 1
+  if (( $(date +%s) - START_TS > TIMEOUT )); then
+    echo "[error] ComfyUI didn't become ready within ${TIMEOUT}s. Last 200 lines:"; tail -n 200 /tmp/comfyui.log || true; exit 1
   fi
 done
 echo "[ok] ComfyUI is READY."
 
-# -------- Background WAN downloads (non-fatal if no token) --------
+# -------- Background WAN downloads (non-fatal) --------
 (
 /usr/bin/python - <<'PY'
 from huggingface_hub import snapshot_download, hf_hub_download
@@ -114,11 +104,48 @@ for i in range(3):
     try:
         grab(); break
     except Exception as e:
-        print(f"[bootstrap] retry {i+1}/3 failed: {e}", flush=True)
-        time.sleep(10)
+        print(f"[bootstrap] retry {i+1}/3 failed: {e}", flush=True); time.sleep(10)
 PY
 ) > /tmp/bootstrap.log 2>&1 &
 
-# -------- Start RunPod serverless worker (FOREGROUND) --------
+# -------- Create WAN aliases for CheckpointLoaderSimple --------
+ckpt_dir="/workspace/comfywan/models/checkpoints"; mkdir -p "${ckpt_dir}"
+pick_first() { for f in "$@"; do [ -f "$f" ] && { echo "$f"; return 0; }; done; return 1; }
+
+# T2V
+T2V_BASE="/workspace/models/diffusion_models/wan2.2-t2v"
+T2V_INDEX="$(pick_first \
+  "${T2V_BASE}/low_noise_model/model.safetensors.index.json" \
+  "${T2V_BASE}/high_noise_model/model.safetensors.index.json" \
+  "${T2V_BASE}/low_noise_model/diffusion_pytorch_model.safetensors.index.json" \
+  "${T2V_BASE}/high_noise_model/diffusion_pytorch_model.safetensors.index.json")"
+if [ -n "${T2V_INDEX:-}" ]; then
+  ln -sf "${T2V_INDEX}" "${ckpt_dir}/wan2.2-t2v.safetensors"
+  echo "[alias] T2V → ${ckpt_dir}/wan2.2-t2v.safetensors -> ${T2V_INDEX}"
+else
+  echo "[alias] WARN: No T2V index found under ${T2V_BASE}"
+fi
+
+# I2V
+I2V_BASE="/workspace/models/diffusion_models/wan2.2-i2v"
+I2V_INDEX="$(pick_first \
+  "${I2V_BASE}/low_noise_model/model.safetensors.index.json" \
+  "${I2V_BASE}/high_noise_model/model.safetensors.index.json" \
+  "${I2V_BASE}/low_noise_model/diffusion_pytorch_model.safetensors.index.json" \
+  "${I2V_BASE}/high_noise_model/diffusion_pytorch_model.safetensors.index.json")"
+if [ -n "${I2V_INDEX:-}" ]; then
+  ln -sf "${I2V_INDEX}" "${ckpt_dir}/wan2.2-i2v.safetensors"
+  echo "[alias] I2V → ${ckpt_dir}/wan2.2-i2v.safetensors -> ${I2V_INDEX}"
+else
+  echo "[alias] WARN: No I2V index found under ${I2V_BASE}"
+fi
+
+# VAE convenience link
+if [ -f "/workspace/models/vae/Wan2.1_VAE.pth" ]; then
+  mkdir -p /workspace/comfywan/models/vae
+  ln -sf /workspace/models/vae/Wan2.1_VAE.pth /workspace/comfywan/models/vae/Wan2.1_VAE.pth
+fi
+
+# -------- Start RunPod worker --------
 echo "[start] Starting RunPod worker…"
 /usr/bin/python -u -m runpod.serverless.worker rp_handler
