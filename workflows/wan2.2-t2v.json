@@ -7,7 +7,7 @@
       "type": "CheckpointLoaderSimple",
       "pos": [80, 80],
       "size": [340, 100],
-      "widgets_values": { "ckpt_name": "wan2.2-i2v.safetensors" },
+      "widgets_values": { "ckpt_name": "wan2.2-t2v.safetensors" },
       "outputs": [
         { "name": "MODEL", "type": "MODEL", "links": [1] },
         { "name": "CLIP", "type": "CLIP", "links": [2, 3] },
@@ -20,7 +20,7 @@
       "pos": [80, 220],
       "size": [320, 110],
       "inputs": { "clip": [1, 1] },
-      "widgets_values": { "text": "photo of a cute red fox, ultra-detailed" },
+      "widgets_values": { "text": "A scenic mountain landscape at sunrise, cinematic, 4K" },
       "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [5] }]
     },
     {
@@ -75,7 +75,7 @@
       "pos": [1560, 200],
       "size": [300, 110],
       "inputs": { "images": [6, 0] },
-      "widgets_values": { "filename_prefix": "wan2.2-i2v-smoke" }
+      "widgets_values": { "filename_prefix": "wan2.2-t2v-smoke" }
     }
   ],
   "links": [
