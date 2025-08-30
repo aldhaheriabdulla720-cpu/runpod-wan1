@@ -1,35 +1,41 @@
 #!/usr/bin/env bash
-# start.sh — ComfyUI headless + WAN bootstrap + RunPod handler (port-wait)
-# - Starts ComfyUI and WAITS for port 8188
-# - Boots RunPod handler AFTER ComfyUI is ready
-# - Continues your background HF downloads (non-fatal if token missing)
+# start.sh — ComfyUI headless + WAN bootstrap + RunPod worker (robust)
+# - Prints GPU sanity info
+# - Launches ComfyUI and WAITS for http://127.0.0.1:8188/system_stats
+# - Starts RunPod serverless worker correctly: runpod.serverless.worker rp_handler
+# - Background WAN downloads (non-fatal if token missing)
 
 set -euo pipefail
 
-# ---------------------------
-# Defaults / ENV
-# ---------------------------
+# -------- ENV (can be overridden in Endpoint Envs) --------
 export COMFY_HOST="${COMFY_HOST:-0.0.0.0}"
 export COMFY_PORT="${COMFY_PORT:-8188}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output}"
-export WORKFLOWS_DIR="${WORKFLOWS_DIR:-/workspace/comfywan/workflows}"
+export TMP_DIR="${TMP_DIR:-/workspace/tmp}"
 
 export HF_TOKEN="${HF_TOKEN:-}"
 export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$HF_TOKEN}"
 
-# Models layout
 export MODELS_ROOT="/workspace/models"
 export DIFF_DIR="${MODELS_ROOT}/diffusion_models"
 export VAE_DIR="${MODELS_ROOT}/vae"
-
-mkdir -p "$OUTPUT_DIR" "$DIFF_DIR" "$VAE_DIR" /workspace/tmp
+mkdir -p "$OUTPUT_DIR" "$TMP_DIR" "$DIFF_DIR" "$VAE_DIR"
 : > /tmp/comfyui.log
 : > /tmp/bootstrap.log
 
-echo "[debug] HF_TOKEN present? $([ -n "${HF_TOKEN}" ] && echo yes || echo no)"
-echo "[debug] HUGGINGFACE_HUB_TOKEN present? $([ -n "${HUGGINGFACE_HUB_TOKEN}" ] && echo yes || echo no)"
+# -------- GPU sanity (prints once at boot) --------
+echo "[gpu] nvidia-smi:"
+(nvidia-smi || echo "no GPU visible")
+python - <<'PY' || true
+import torch
+print("[gpu] torch.cuda.is_available():", torch.cuda.is_available())
+print("[gpu] torch.cuda.device_count():", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("[gpu] device 0:", torch.cuda.get_device_name(0))
+PY
 
-/usr/bin/python - <<'PY' >/tmp/hf_whoami.log 2>&1 || true
+# -------- Optional: HF whoami (non-fatal) --------
+python - <<'PY' >/tmp/hf_whoami.log 2>&1 || true
 import os
 from huggingface_hub import HfApi
 tok = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or ""
@@ -43,31 +49,19 @@ else:
     print("[debug] Skipping whoami; no hf_ token")
 PY
 
-# ---------------------------
-# Start ComfyUI (background)
-# ---------------------------
+# -------- Start ComfyUI (background) --------
 cd /workspace/comfywan
 echo "[start] Launching ComfyUI on ${COMFY_HOST}:${COMFY_PORT} ..."
 /usr/bin/python main.py \
   --listen "${COMFY_HOST}" \
   --port "${COMFY_PORT}" \
   --output-directory "${OUTPUT_DIR}" \
-  --temp-directory /workspace/tmp \
+  --temp-directory "${TMP_DIR}" \
   2>&1 | tee -a /tmp/comfyui.log &
 COMFY_PID=$!
-echo "[ok] ComfyUI PID=${COMFY_PID}"
+trap 'kill -TERM "$COMFY_PID" 2>/dev/null || true; wait "$COMFY_PID" 2>/dev/null || true' INT TERM
 
-cleanup() {
-  echo "[stop] Stopping..."
-  kill -TERM "$COMFY_PID" 2>/dev/null || true
-  wait "$COMFY_PID" 2>/dev/null || true
-  echo "[stop] Done."
-}
-trap cleanup TERM INT
-
-# ---------------------------
-# Wait for ComfyUI port
-# ---------------------------
+# -------- Wait for port (max 300s) --------
 WAIT_URL="http://127.0.0.1:${COMFY_PORT}/system_stats"
 TIMEOUT=300
 echo "[wait] Waiting for ComfyUI at ${WAIT_URL} (timeout ${TIMEOUT}s)..."
@@ -83,38 +77,31 @@ until curl -fsS "$WAIT_URL" >/dev/null 2>&1; do
 done
 echo "[ok] ComfyUI is READY."
 
-# ---------------------------
-# Background WAN downloads (non-fatal if no token)
-# ---------------------------
+# -------- Background WAN downloads (non-fatal) --------
 (
 /usr/bin/python - <<'PY'
 from huggingface_hub import snapshot_download, hf_hub_download
 import os, time, sys
-
-token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or None
+tok = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or None
 root  = "/workspace/models"
 diff  = os.path.join(root, "diffusion_models")
 vae   = os.path.join(root, "vae")
 os.makedirs(diff, exist_ok=True); os.makedirs(vae, exist_ok=True)
-
 def grab():
     print("[bootstrap] Downloading Wan-AI/Wan2.2-T2V-A14B ...", flush=True)
     snapshot_download("Wan-AI/Wan2.2-T2V-A14B",
                       local_dir=os.path.join(diff,"wan2.2-t2v"),
-                      token=token, max_retries=3, resume_download=True)
+                      token=tok, max_retries=3, resume_download=True)
     print("[bootstrap] Downloading Wan-AI/Wan2.2-I2V-A14B ...", flush=True)
     snapshot_download("Wan-AI/Wan2.2-I2V-A14B",
                       local_dir=os.path.join(diff,"wan2.2-i2v"),
-                      token=token, max_retries=3, resume_download=True)
+                      token=tok, max_retries=3, resume_download=True)
     print("[bootstrap] Downloading Wan2.1_VAE.pth ...", flush=True)
     hf_hub_download("Wan-AI/Wan2.2-T2V-A14B", filename="Wan2.1_VAE.pth",
-                    local_dir=vae, token=token)
+                    local_dir=os.path.join(root, "vae"), token=tok)
     print("[bootstrap] WAN 2.2 downloads complete.", flush=True)
-
-if not token:
-    print("[bootstrap] HF token missing; skipping WAN downloads (handler is live).", flush=True)
-    sys.exit(0)
-
+if not tok:
+    print("[bootstrap] HF token missing; skipping WAN downloads (handler is live).", flush=True); sys.exit(0)
 for i in range(3):
     try:
         grab(); break
@@ -124,8 +111,6 @@ for i in range(3):
 PY
 ) > /tmp/bootstrap.log 2>&1 &
 
-# ---------------------------
-# Start RunPod serverless worker (FOREGROUND)
-# ---------------------------
-echo "[start] Starting RunPod worker (after Comfy is ready)..."
-exec /usr/bin/python -u -m runpod
+# -------- Start RunPod serverless worker (FOREGROUND) --------
+echo "[start] Starting RunPod worker…"
+/usr/bin/python -u -m runpod.serverless.worker rp_handler
