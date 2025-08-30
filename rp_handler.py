@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, time, base64, traceback
+import os, json, time, traceback
 import requests
 import runpod
 
@@ -20,7 +20,6 @@ def wait_for_comfy(timeout=180):
     return False
 
 def _load_workflow(spec):
-    # Accept filename (in /workspace/workflows) or inline dict
     if isinstance(spec, dict):
         return spec
     if isinstance(spec, str):
@@ -43,7 +42,6 @@ def _poll_history(prompt_id, timeout=600):
         r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
         if r.ok:
             j = r.json()
-            # Comfy returns dict keyed by prompt_id, or a structure with results
             if isinstance(j, dict) and prompt_id in j:
                 return j[prompt_id]
             return j
@@ -54,7 +52,6 @@ def handler(event):
     try:
         inp = (event or {}).get("input", {}) or {}
 
-        # Health / readiness probe
         if inp.get("dry_run"):
             ready = wait_for_comfy()
             wf = inp.get("workflow")
@@ -63,7 +60,6 @@ def handler(event):
                 wf_exists = os.path.exists(os.path.join(WORKFLOWS_DIR, wf))
             return {"status": "ok", "comfy_ready": bool(ready), "workflow": wf, "workflow_exists": bool(wf_exists)}
 
-        # Run a real job
         wf_spec = inp.get("workflow")
         if wf_spec is None:
             return {"error": "Missing 'workflow' parameter"}
@@ -73,9 +69,7 @@ def handler(event):
 
         workflow = _load_workflow(wf_spec)
 
-        # Optional param patching (example)
-        # if "params" in inp:
-        #     ...edit workflow dict here if needed...
+        # (Optional) edit workflow using inp["params"] here
 
         prompt_id = _post_prompt(workflow)
         result = _poll_history(prompt_id)
